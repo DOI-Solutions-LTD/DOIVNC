@@ -32,8 +32,13 @@ import {
   safeInvoke,
   safeListen,
   forgetCertificate,
+  importRdpFiles,
+  pickRdpFiles,
+  takePendingRdpFiles,
+  RDP_OPEN_EVENT,
   type OpenSessionOptions,
 } from "../lib/tauri";
+import { findExistingHost, importedName, splitRdpUser } from "../lib/rdpImport";
 import { seedMockThumbnails, useMockData } from "../lib/mock";
 import { useSessions } from "../state/SessionsContext";
 import { useTabs } from "../state/TabsContext";
@@ -794,6 +799,113 @@ export function Library({
     return () => stop?.();
   }, [openSession]);
 
+  // ------------------------------------------------------------ .rdp files
+
+  /**
+   * Import `.rdp` files into the library, and optionally connect to them.
+   *
+   * Each file becomes a saved RDP host, or, when a host with the same name,
+   * address and port is already saved, refreshes that host's stored user name
+   * and leaves its settings alone (`findExistingHost`). The file's password
+   * blob is never read (`vnc_store::parse_rdp_file`), so a password is still
+   * only stored after a server accepted it.
+   *
+   * `connect` is for files the app was asked to OPEN (a double-click, "Open
+   * with"); a bulk import from the button or the File menu only saves.
+   */
+  const importRdp = useCallback(
+    async (paths: string[], connect: boolean): Promise<void> => {
+      if (paths.length === 0) return;
+      let rows;
+      try {
+        rows = await importRdpFiles(paths);
+      } catch (err) {
+        push("danger", `Could not import: ${String(err)}`);
+        return;
+      }
+      const saved: HostProfile[] = [];
+      const failed: string[] = [];
+      let updated = 0;
+      let warnings = 0;
+      for (const row of rows) {
+        const draft = row.import;
+        if (!draft) {
+          failed.push(row.error ?? row.path);
+          continue;
+        }
+        warnings += draft.warnings.length;
+        const name = importedName(draft.profile.friendlyName);
+        // Hosts saved earlier in this batch count too: the library's list only
+        // catches up on the next render, and two copies of one gateway file
+        // in a single selection must still become one host.
+        const existing = findExistingHost([...saved, ...hostsRef.current], draft.profile, name);
+        let host: HostProfile | null = existing ?? null;
+        if (existing) {
+          if (!saved.some((h) => h.id === existing.id)) updated += 1;
+        } else {
+          const { id: _draftId, ...profile } = draft.profile;
+          host = await saveHost({ ...profile, friendlyName: name, groupId: null, tags: [] });
+        }
+        if (!host) {
+          failed.push(`${name}: could not be saved`);
+          continue;
+        }
+        const target: HostProfile = host;
+        const { user, domain } = splitRdpUser(draft.username);
+        await saveRdpCredentials(target.id, { user, domain, password: "" });
+        if (!saved.some((h) => h.id === target.id)) saved.push(target);
+      }
+
+      if (connect) {
+        selectTab(null);
+        for (const host of saved) connectHost(host);
+      }
+      if (failed.length > 0) {
+        push("danger", `Could not import ${failed.length} file(s): ${failed.join("; ")}`);
+      }
+      if (!connect && saved.length > 0) {
+        const added = Math.max(0, saved.length - updated);
+        const parts = [
+          added > 0 ? `added ${added}` : null,
+          updated > 0 ? `updated ${updated}` : null,
+        ].filter(Boolean);
+        push(
+          warnings > 0 ? "warning" : "success",
+          `Remote Desktop files: ${parts.join(", ")}` +
+            (warnings > 0 ? ` (${warnings} setting(s) could not be carried over)` : ""),
+        );
+      }
+    },
+    [saveHost, saveRdpCredentials, push, selectTab, connectHost],
+  );
+
+  const importRdpFromPicker = useCallback(async (): Promise<void> => {
+    const paths = await pickRdpFiles();
+    await importRdp(paths, false);
+  }, [importRdp]);
+
+  // Files the app was asked to open: whatever was queued before this mounted
+  // (the launch's own command line), then anything a later double-click
+  // forwards into the running app.
+  useEffect(() => {
+    if (!inTauri()) return;
+    let cancelled = false;
+    let unlisten: (() => void) | undefined;
+    const drain = async (): Promise<void> => {
+      const paths = await takePendingRdpFiles();
+      if (!cancelled && paths.length > 0) await importRdp(paths, true);
+    };
+    void safeListen<null>(RDP_OPEN_EVENT, () => void drain()).then((fn) => {
+      if (cancelled) fn();
+      else unlisten = fn;
+    });
+    void drain();
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
+  }, [importRdp]);
+
   const saveDraft = useCallback(
     async (draft: HostDraft): Promise<void> => {
       const saved = await saveHost({
@@ -980,6 +1092,11 @@ export function Library({
   useEffect(() => {
     let unlisten: (() => void) | undefined;
     void safeListen<{ id: string }>("menu://action", ({ id }) => {
+      if (id === "menu:import-rdp") {
+        selectTab(null);
+        void importRdpFromPicker();
+        return;
+      }
       if (id !== "menu:quick-connect" && id !== "menu:new-host") return;
       selectTab(null);
       // Focus cannot land on an element that is still hidden, so let the pane
@@ -992,7 +1109,7 @@ export function Library({
       unlisten = fn;
     });
     return () => unlisten?.();
-  }, [focusQuickConnect, selectTab]);
+  }, [focusQuickConnect, selectTab, importRdpFromPicker]);
 
   // ------------------------------------------------------------ context menu
 
@@ -1240,6 +1357,16 @@ export function Library({
           <IconZap size={14} />
           {scan.running ? "Scanning…" : "Scan network"}
         </button>
+        {inTauri() ? (
+          <button
+            type="button"
+            className="btn-secondary"
+            title="Import one or more Microsoft Remote Desktop (.rdp) files"
+            onClick={() => void importRdpFromPicker()}
+          >
+            Import .rdp
+          </button>
+        ) : null}
         <button type="button" className="btn-primary" onClick={() => setHostDialog(draftFromHost(null))}>
           <IconPlus size={14} /> New Host
         </button>

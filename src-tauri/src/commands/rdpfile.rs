@@ -17,8 +17,79 @@
 //! after a server has accepted it.
 
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
+use tauri::{AppHandle, Emitter, Manager};
 use vnc_store::{RdpImport, MAX_RDP_FILE_BYTES};
+
+/// Emitted to the library window when `.rdp` files are waiting in
+/// [`PendingRdpFiles`]. It carries nothing: the library answers it with
+/// [`take_pending_rdp_files`], which is also what it calls once on mount, so a
+/// file passed at launch, before any listener existed, is not lost.
+pub const OPEN_EVENT: &str = "rdp-file://open";
+
+/// `.rdp` files the app was asked to open, by a double-click, "Open with" or
+/// the command line, that the library has not picked up yet.
+///
+/// A queue rather than an event payload because the first launch's files
+/// arrive before the webview is listening; the second launch's are forwarded
+/// by the single-instance plugin into the running app and take the same road.
+#[derive(Default)]
+pub struct PendingRdpFiles(Mutex<Vec<String>>);
+
+/// The `.rdp` paths among a process's arguments, made absolute.
+///
+/// `args` excludes the executable itself. A relative path is resolved against
+/// `cwd`, which matters for the forwarded arguments of a second launch: they
+/// were relative to THAT process's directory, not this one's. Anything that is
+/// not an existing `*.rdp` file is skipped, so the app's own flags (the
+/// autostart `--background`, say) never get here.
+pub fn rdp_paths_from_args<I>(args: I, cwd: Option<&Path>) -> Vec<String>
+where
+    I: IntoIterator<Item = String>,
+{
+    args.into_iter()
+        .filter(|a| {
+            Path::new(a)
+                .extension()
+                .is_some_and(|e| e.eq_ignore_ascii_case("rdp"))
+        })
+        .map(|a| {
+            let p = PathBuf::from(&a);
+            match cwd {
+                Some(dir) if p.is_relative() => dir.join(p),
+                _ => p,
+            }
+        })
+        .filter(|p| p.is_file())
+        .map(|p| p.to_string_lossy().into_owned())
+        .collect()
+}
+
+/// Queue `paths` for the library and tell it they are there.
+pub fn queue_for_library(app: &AppHandle, paths: Vec<String>) {
+    if paths.is_empty() {
+        return;
+    }
+    let Some(pending) = app.try_state::<PendingRdpFiles>() else {
+        tracing::warn!("rdp files arrived before the pending queue existed; dropping them");
+        return;
+    };
+    if let Ok(mut queue) = pending.0.lock() {
+        queue.extend(paths);
+    }
+    let _ = app.emit_to("main", OPEN_EVENT, ());
+}
+
+/// Hand the library every `.rdp` path waiting to be opened, and forget them.
+#[tauri::command]
+pub fn take_pending_rdp_files(pending: tauri::State<'_, PendingRdpFiles>) -> Vec<String> {
+    pending
+        .0
+        .lock()
+        .map(|mut queue| std::mem::take(&mut *queue))
+        .unwrap_or_default()
+}
 
 /// One file's result in a multi-file import.
 ///
@@ -142,6 +213,31 @@ mod tests {
         let path = write(dir.path(), "huge.rdp", &vec![b'x'; MAX_RDP_FILE_BYTES + 1]);
         let err = import_one(&path).expect_err("over the cap");
         assert!(err.contains("too large"), "{err}");
+    }
+
+    /// Only existing `.rdp` files come out of a command line, whatever the
+    /// case of the extension, and a relative one is resolved against the
+    /// directory the launching process was in.
+    #[test]
+    fn rdp_paths_are_picked_out_of_the_arguments() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let a = write(dir.path(), "a.rdp", b"full address:s:a\n");
+        write(dir.path(), "B.RDP", b"full address:s:b\n");
+        let args = vec![
+            "--background".to_owned(),
+            a.to_string_lossy().into_owned(),
+            "B.RDP".to_owned(),
+            "missing.rdp".to_owned(),
+            "notes.txt".to_owned(),
+        ];
+        let got = rdp_paths_from_args(args, Some(dir.path()));
+        assert_eq!(
+            got,
+            vec![
+                a.to_string_lossy().into_owned(),
+                dir.path().join("B.RDP").to_string_lossy().into_owned(),
+            ]
+        );
     }
 
     #[test]

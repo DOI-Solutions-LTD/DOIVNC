@@ -140,6 +140,10 @@ fn main() {
             // this work adds and each is a grant to review on its own.
             "import_rdp_file",
             "import_rdp_files",
+            // The `.rdp` paths a double-click or "Open with" handed the app,
+            // collected by the shell from its own command line. Returns paths
+            // only; the files are read by `import_rdp_files` as above.
+            "take_pending_rdp_files",
             // credentials (write/query only, passwords never flow back to JS)
             "save_password",
             "has_password",

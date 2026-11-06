@@ -46,6 +46,7 @@
     "allow-sync-session-menu",
     "allow-import-rdp-file",
     "allow-import-rdp-files",
+    "allow-take-pending-rdp-files",
 
     "allow-save-password",
     "allow-has-password",

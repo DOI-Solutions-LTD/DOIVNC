@@ -59,12 +59,20 @@ pub fn run() {
         builder = builder
             // Must be registered first so a second launch is forwarded before
             // any other plugin runs.
-            .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+            .plugin(tauri_plugin_single_instance::init(|app, argv, cwd| {
                 if let Some(window) = app.get_webview_window("main") {
                     let _ = window.show();
                     let _ = window.unminimize();
                     let _ = window.set_focus();
                 }
+                // Double-clicking a `.rdp` file while the app is running starts
+                // a second process, which this plugin turns into this call.
+                // Its arguments name the file, relative to ITS directory.
+                let paths = commands::rdpfile::rdp_paths_from_args(
+                    argv.into_iter().skip(1),
+                    Some(std::path::Path::new(&cwd)),
+                );
+                commands::rdpfile::queue_for_library(app, paths);
             }))
             // The ONLY thing the global-shortcut plugin is used for is the
             // capture escape hatch. It is the wrong tool for capture itself
@@ -105,6 +113,13 @@ pub fn run() {
             let files_state = commands::files::FilesState::new(data_dir);
             let host_keys = files_state.host_key_verifier();
             app.manage(AppState::new(store, credentials, host_keys));
+            // `.rdp` files this launch was asked to open (a double-click, or
+            // "Open with"). The library takes them once it is listening.
+            app.manage(commands::rdpfile::PendingRdpFiles::default());
+            commands::rdpfile::queue_for_library(
+                app.handle(),
+                commands::rdpfile::rdp_paths_from_args(std::env::args().skip(1), None),
+            );
             // Boundary's lasting helper identity, and saving computers that
             // pair this helper, so they appear in the Library to reopen.
             commands::boundary::install(app.handle(), &boundary_dir);
@@ -238,6 +253,7 @@ pub fn run() {
             // .rdp file import
             commands::rdpfile::import_rdp_file,
             commands::rdpfile::import_rdp_files,
+            commands::rdpfile::take_pending_rdp_files,
             // credentials
             commands::credentials::save_password,
             commands::credentials::has_password,

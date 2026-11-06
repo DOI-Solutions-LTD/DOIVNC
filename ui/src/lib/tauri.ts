@@ -5,7 +5,7 @@
  */
 import { invoke, isTauri as tauriDetect } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-import type { ProtocolKind } from "./types";
+import type { HostProfile, ProtocolKind } from "./types";
 
 export function inTauri(): boolean {
   try {
@@ -551,6 +551,48 @@ async function nativeOpen(options: Record<string, unknown>): Promise<string[]> {
 /** Pick files to upload. */
 export function pickLocalFiles(title = "Choose files to send"): Promise<string[]> {
   return nativeOpen({ multiple: true, directory: false, title });
+}
+
+/** Pick one or more Microsoft `.rdp` files to import. */
+export function pickRdpFiles(title = "Import Remote Desktop files"): Promise<string[]> {
+  return nativeOpen({
+    multiple: true,
+    directory: false,
+    title,
+    filters: [{ name: "Remote Desktop files", extensions: ["rdp"] }],
+  });
+}
+
+/**
+ * The draft a `.rdp` file describes (`vnc_store::RdpImport`). Only the fields
+ * the library acts on are typed; the shell sends more.
+ */
+export interface RdpImport {
+  profile: HostProfile;
+  /** The file's `username`, which may be `DOMAIN\user`. Never a password. */
+  username: string | null;
+  warnings: string[];
+}
+
+/** One row of `import_rdp_files`: a draft, or the reason there is none. */
+export interface RdpFileImport {
+  path: string;
+  import?: RdpImport;
+  error?: string;
+}
+
+/** Parse `.rdp` files in the shell. One row per path, in order; never throws per file. */
+export function importRdpFiles(paths: string[]): Promise<RdpFileImport[]> {
+  return mustInvoke<RdpFileImport[]>("import_rdp_files", { paths });
+}
+
+/** Emitted by the shell when `.rdp` files are waiting to be opened. */
+export const RDP_OPEN_EVENT = "rdp-file://open";
+
+/** `.rdp` files a double-click or "Open with" handed the app, not yet opened. */
+export async function takePendingRdpFiles(): Promise<string[]> {
+  if (!inTauri()) return [];
+  return (await safeInvoke<string[]>("take_pending_rdp_files", undefined, [])) ?? [];
 }
 
 /** Pick the directory downloads land in. */

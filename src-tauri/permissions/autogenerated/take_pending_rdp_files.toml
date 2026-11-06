@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-take-pending-rdp-files"
+description = "Enables the take_pending_rdp_files command without any pre-configured scope."
+commands.allow = ["take_pending_rdp_files"]
+
+[[permission]]
+identifier = "deny-take-pending-rdp-files"
+description = "Denies the take_pending_rdp_files command without any pre-configured scope."
+commands.deny = ["take_pending_rdp_files"]
