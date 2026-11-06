@@ -146,7 +146,16 @@ pub struct RunLoop<R> {
     /// Frames and rectangles handed to the renderer since the last tick.
     frames_since_tick: u32,
     rects_decoded: u64,
+    /// Drawing order updates dropped because this client cannot render them.
+    orders_dropped: u64,
+    /// When the last repaint was asked for because orders were dropped, so a
+    /// server that keeps sending them is not answered with a refresh storm.
+    orders_refresh_at: Option<Instant>,
 }
+
+/// The shortest gap between two repaints asked for because drawing orders
+/// were dropped.
+const ORDERS_REFRESH_INTERVAL: Duration = Duration::from_millis(750);
 
 impl<R: AsyncRead + Unpin> RunLoop<R> {
     /// Wire up one connection's pump.
@@ -187,7 +196,39 @@ impl<R: AsyncRead + Unpin> RunLoop<R> {
             last_tick_at: None,
             frames_since_tick: 0,
             rects_decoded: 0,
+            orders_dropped: 0,
+            orders_refresh_at: None,
         }
+    }
+
+    /// Drawing orders arrived although `orderSupport` said none are
+    /// supported (MS-RDPBCGR 2.2.7.1.3).
+    ///
+    /// A conforming Windows host never does this, but RDP gateways and
+    /// session recorders such as Fudo PAM forward orders whatever the client
+    /// advertised. Ending the session over it made those hosts unusable, so
+    /// the orders are dropped and the whole desktop is asked for again as
+    /// bitmaps (MS-RDPBCGR 2.2.11.2), at most once per
+    /// [`ORDERS_REFRESH_INTERVAL`]. Whatever the orders would have drawn is
+    /// repainted by that refresh.
+    fn orders_dropped(&mut self) -> Result<Option<Bytes>> {
+        self.orders_dropped += 1;
+        if self.orders_dropped == 1 || self.orders_dropped.is_multiple_of(1000) {
+            tracing::warn!(
+                dropped = self.orders_dropped,
+                "the server sent GDI drawing orders this client did not advertise; \
+                 dropping them and asking for a bitmap refresh"
+            );
+        }
+        let now = Instant::now();
+        if self
+            .orders_refresh_at
+            .is_some_and(|then| now.duration_since(then) < ORDERS_REFRESH_INTERVAL)
+        {
+            return Ok(None);
+        }
+        self.orders_refresh_at = Some(now);
+        self.encode_refresh().map(Some)
     }
 
     /// The auto reconnect cookie this connection was given, if any.
@@ -456,6 +497,7 @@ impl<R: AsyncRead + Unpin> RunLoop<R> {
         let pdu = FastPathUpdatePdu::decode(&mut Reader::new(frame))?;
         let mut rects: Vec<DecodedRect> = Vec::new();
         let mut events: Vec<SessionEvent> = Vec::new();
+        let mut saw_orders = false;
 
         for item in pdu.updates() {
             let update = item?;
@@ -486,7 +528,7 @@ impl<R: AsyncRead + Unpin> RunLoop<R> {
             )?;
             match fp {
                 FastPathUpdate::Graphics(update) => {
-                    route_graphics(graphics, &update, &mut rects)?;
+                    saw_orders |= route_graphics(graphics, &update, &mut rects)?;
                 }
                 FastPathUpdate::Pointer(update) => {
                     if let Some(event) = graphics.pointer(&update)? {
@@ -512,10 +554,12 @@ impl<R: AsyncRead + Unpin> RunLoop<R> {
             }
         }
         flush(&mut rects, &mut events);
-        Ok(SessionSignal::Output {
-            events,
-            reply: None,
-        })
+        let reply = if saw_orders {
+            self.orders_dropped()?
+        } else {
+            None
+        };
+        Ok(SessionSignal::Output { events, reply })
     }
 
     fn dispatch_tpkt(&mut self, frame: &Bytes) -> Result<SessionSignal> {
@@ -642,7 +686,9 @@ impl<R: AsyncRead + Unpin> RunLoop<R> {
                 tracing::info!("the server deactivated the share");
             }
             SharePdu::Data { pdu, .. } => {
-                self.share_data(pdu, &mut events)?;
+                if self.share_data(pdu, &mut events)? {
+                    reply = self.orders_dropped()?;
+                }
             }
             SharePdu::ServerRedirection { body, .. } => {
                 return self.server_redirection(body.as_slice());
@@ -659,9 +705,16 @@ impl<R: AsyncRead + Unpin> RunLoop<R> {
     }
 
     /// One Share Data PDU (MS-RDPBCGR 2.2.8.1.1.1.2).
-    fn share_data(&mut self, pdu: &ShareDataPdu<'_>, events: &mut Vec<SessionEvent>) -> Result<()> {
+    ///
+    /// Returns true when the PDU was a drawing order update that was dropped.
+    fn share_data(
+        &mut self,
+        pdu: &ShareDataPdu<'_>,
+        events: &mut Vec<SessionEvent>,
+    ) -> Result<bool> {
         use rdp_pdu::rdp::share::pdu_type2;
 
+        let mut saw_orders = false;
         match pdu {
             ShareDataPdu::SetErrorInfo(info) => {
                 // Latched rather than raised: the server sends this and then
@@ -708,7 +761,7 @@ impl<R: AsyncRead + Unpin> RunLoop<R> {
                 pdu_type2::UPDATE => {
                     let update = GraphicsUpdate::decode(&mut Reader::new(body.as_slice()))?;
                     let mut rects = Vec::new();
-                    route_graphics(&mut self.graphics, &update, &mut rects)?;
+                    saw_orders = route_graphics(&mut self.graphics, &update, &mut rects)?;
                     flush(&mut rects, events);
                 }
                 pdu_type2::ARC_STATUS => self.auto_reconnect_status(body.as_slice()),
@@ -729,7 +782,7 @@ impl<R: AsyncRead + Unpin> RunLoop<R> {
                 );
             }
         }
-        Ok(())
+        Ok(saw_orders)
     }
 
     /// `TS_LOGON_INFO_EXTENDED` (MS-RDPBCGR 2.2.10.1.1.4).
@@ -1160,32 +1213,33 @@ fn flush(rects: &mut Vec<DecodedRect>, events: &mut Vec<SessionEvent>) {
 }
 
 /// One graphics update into rectangles, or into the palette.
+///
+/// Returns true when the update was drawing orders, which are dropped: the
+/// caller asks for a bitmap refresh so the screen does not stay stale
+/// ([`RunLoop::orders_dropped`]).
 fn route_graphics(
     graphics: &mut Graphics,
     update: &GraphicsUpdate<'_>,
     rects: &mut Vec<DecodedRect>,
-) -> Result<()> {
+) -> Result<bool> {
     match update {
         GraphicsUpdate::Bitmap(bitmap) => {
             let (decoded, _damage) = graphics.bitmap_update(bitmap)?;
             rects.extend(decoded);
-            Ok(())
+            Ok(false)
         }
         GraphicsUpdate::Palette(palette) => {
             graphics.set_palette(palette);
-            Ok(())
+            Ok(false)
         }
         // A server sends one after a Deactivate All cycle and it means
         // nothing to a client that keeps no drawing state.
-        GraphicsUpdate::Synchronize => Ok(()),
-        // PRDRDP/04 §8.4: a server that sends drawing orders after being told
-        // `orderSupport` is all zero is broken, and painting nothing while the
-        // user watches a frozen screen is worse than saying so.
-        GraphicsUpdate::Orders(_) => Err(RdpError::Protocol(
-            "the server sent GDI drawing orders, which this client told it were not supported \
-             (MS-RDPBCGR 2.2.7.1.3, PRDRDP/04 §8.4)"
-                .to_owned(),
-        )),
+        GraphicsUpdate::Synchronize => Ok(false),
+        // PRDRDP/04 §8.4 treated these as fatal: a server that sends drawing
+        // orders after being told `orderSupport` is all zero is broken. RDP
+        // gateways (Fudo PAM) do exactly that, and ending the session made
+        // them unusable, so the orders are dropped and repainted instead.
+        GraphicsUpdate::Orders(_) => Ok(true),
     }
 }
 
@@ -1368,8 +1422,10 @@ mod tests {
         }
 
         // `drdynvc` and `cliprdr` now go to their handlers. A chunk with no
-        // `CHANNEL_FLAG_FIRST` is refused by the reassembler, which proves
-        // the PDU reached the channel layer rather than the bin.
+        // `CHANNEL_FLAG_FIRST` is dropped by the channel layer rather than
+        // ending the session (RDP gateways send them), and the answer is a
+        // `Channel` signal rather than an `Ignored` one, which proves the PDU
+        // reached the channel layer rather than the bin.
         let mut orphan = Vec::new();
         ChannelPduHeader {
             length: 16,
@@ -1384,11 +1440,16 @@ mod tests {
                 channel_id: id,
                 payload: Payload::new(&orphan),
             });
-            let err = rl.dispatch(&known).expect_err("no preceding first chunk");
-            assert!(
-                err.to_string().contains("CHANNEL_FLAG_FIRST"),
-                "{id}: {err}"
-            );
+            match rl
+                .dispatch(&known)
+                .expect("an orphan chunk is dropped, not fatal")
+            {
+                SessionSignal::Channel { events, frames } => {
+                    assert!(events.is_empty(), "{id}: {events:?}");
+                    assert!(frames.is_empty(), "{id}: {frames:?}");
+                }
+                other => panic!("expected a channel signal for {id}, got {other:?}"),
+            }
         }
     }
 
@@ -1467,6 +1528,56 @@ mod tests {
             }
             other => panic!("expected a framebuffer update, got {other:?}"),
         }
+    }
+
+    /// A Fudo PAM gateway forwards drawing orders although `orderSupport`
+    /// said none are supported. `TS_FP_UPDATE_ORDERS` starts with
+    /// `numberOrders`, not an `updateType`, so `01 00` is one order. It used
+    /// to end the session ("invalid updateType = 0x1"); it is now dropped,
+    /// answered with one Refresh Rect, and a second one straight after is not
+    /// answered again.
+    #[test]
+    fn fast_path_drawing_orders_are_dropped_and_answered_with_one_refresh() {
+        // One primary order: numberOrders = 1, then controlFlags TS_STANDARD
+        // and a few order bytes. The content is never looked at.
+        let body = [0x01, 0x00, 0x09, 0x01, 0x0a, 0x00, 0x14, 0x00];
+        let orders = || {
+            let mut wire = Vec::new();
+            encode_fastpath_update(
+                &mut Writer::new(&mut wire),
+                &[FpUpdate {
+                    header: FpUpdateHeader::single(update_code::ORDERS),
+                    data: Payload::new(&body),
+                }],
+            )
+            .expect("encodes");
+            Framed {
+                kind: FramedKind::FastPath,
+                frame: Bytes::from(wire),
+            }
+        };
+
+        let mut rl = loop_over(&[]);
+        let SessionSignal::Output { events, reply } = rl
+            .dispatch(&orders())
+            .expect("orders no longer end the session")
+        else {
+            panic!("expected output");
+        };
+        assert!(events.is_empty(), "{events:?}");
+        assert!(
+            reply.is_some(),
+            "the first dropped orders ask for a refresh"
+        );
+
+        let SessionSignal::Output { reply, .. } = rl.dispatch(&orders()).expect("still fine")
+        else {
+            panic!("expected output");
+        };
+        assert!(
+            reply.is_none(),
+            "a second refresh inside the interval is held back"
+        );
     }
 
     /// The same bytes arrive on the slow path inside a Share Data PDU, and

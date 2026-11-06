@@ -562,7 +562,16 @@ impl<'a> FastPathUpdate<'a> {
     pub fn decode_body(update_code: u8, data: &'a [u8]) -> PduResult<Self> {
         let mut r = Reader::new(data);
         let update = match update_code {
-            update_code::ORDERS | update_code::BITMAP | update_code::PALETTE => {
+            // `TS_FP_UPDATE_ORDERS` (MS-RDPBCGR 2.2.9.1.2.1.1) is the one
+            // graphics body WITHOUT an `updateType`: it is `numberOrders`
+            // followed by the order data. Reading the order count as an
+            // `updateType` turned a single order (`01 00`) into
+            // "invalid updateType = 0x1" and killed the session behind a
+            // Fudo RDP gateway, which forwards orders whatever the client's
+            // `orderSupport` said. The body is carried whole so the caller can
+            // decide what to do with orders it never asked for.
+            update_code::ORDERS => Self::Graphics(GraphicsUpdate::Orders(Payload::new(r.rest()))),
+            update_code::BITMAP | update_code::PALETTE => {
                 // The fast path body still carries its own two octet
                 // `updateType`, even though the four bit update code in the
                 // header already said the same thing (MS-RDPBCGR 2.2.9.1.2.1.1
@@ -669,6 +678,8 @@ impl<'a> FastPathUpdate<'a> {
             // update code has already said everything the slow path's two
             // pad bytes say.
             Self::Graphics(GraphicsUpdate::Synchronize) => 0,
+            // `TS_FP_UPDATE_ORDERS` has no `updateType` (2.2.9.1.2.1.1).
+            Self::Graphics(GraphicsUpdate::Orders(payload)) => payload.len(),
             // Two for the `updateType` the body carries, which `encode_body`
             // writes and `decode_body` reads.
             Self::Graphics(update) => 2 + update.body_size(),
@@ -682,6 +693,8 @@ impl<'a> FastPathUpdate<'a> {
     pub fn encode_body(&self, w: &mut Writer<'_>) -> PduResult<()> {
         match self {
             Self::Graphics(GraphicsUpdate::Synchronize) => Ok(()),
+            // `numberOrders` and the orders, with no `updateType` in front.
+            Self::Graphics(update @ GraphicsUpdate::Orders(_)) => update.encode_body(w),
             Self::Graphics(update) => {
                 // Symmetric with `decode_body`: the two octet `updateType`
                 // is part of the fast path body, so a mock server that omits
@@ -707,8 +720,26 @@ mod tests {
     use crate::update::tests::{bitmap_update, color_pointer};
     use crate::update::{PaletteUpdate, Point16};
 
+    /// `TS_FP_UPDATE_ORDERS` starts with `numberOrders`, not an
+    /// `updateType`: `01 00` is one order, and a Fudo PAM gateway sends
+    /// exactly that. It used to be refused as "invalid updateType = 0x1".
+    #[test]
+    fn an_orders_body_has_no_update_type() {
+        let body = [0x01, 0x00, 0x09, 0x01, 0x0a, 0x00];
+        let decoded = FastPathUpdate::decode_body(update_code::ORDERS, &body).unwrap();
+        assert_eq!(
+            decoded,
+            FastPathUpdate::Graphics(GraphicsUpdate::Orders(Payload::new(&body)))
+        );
+        assert_eq!(decoded.body_size(), body.len());
+        let mut out = Vec::new();
+        decoded.encode_body(&mut Writer::new(&mut out)).unwrap();
+        assert_eq!(out, body);
+    }
+
     fn bodies() -> Vec<FastPathUpdate<'static>> {
         vec![
+            FastPathUpdate::Graphics(GraphicsUpdate::Orders(Payload::new(&[0x01, 0x00, 0xaa]))),
             FastPathUpdate::Graphics(GraphicsUpdate::Bitmap(bitmap_update())),
             FastPathUpdate::Graphics(GraphicsUpdate::Palette(Box::<PaletteUpdate>::default())),
             FastPathUpdate::Graphics(GraphicsUpdate::Synchronize),

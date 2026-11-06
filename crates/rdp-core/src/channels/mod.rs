@@ -267,8 +267,25 @@ impl StaticChannels {
             reassembler,
             handler,
             id,
-            ..
+            name,
         } = entry;
+        // A chunk that neither starts a message nor continues one belongs to
+        // nothing. The reassembler refuses it, and a conforming Windows host
+        // never sends one, but RDP gateways such as Fudo PAM do (seen on
+        // `cliprdr` with flags 0x0c080100). Ending the session over a channel
+        // message nobody can place made those hosts unusable; dropping it
+        // costs at most that one message and leaves the reassembler clean
+        // for the next `CHANNEL_FLAG_FIRST`.
+        if !header.is_first() && !reassembler.in_progress() {
+            tracing::warn!(
+                channel = *name,
+                flags = format_args!("{:#x}", header.flags),
+                length = header.length,
+                chunk = chunk.len(),
+                "dropping a channel chunk without a preceding CHANNEL_FLAG_FIRST"
+            );
+            return Ok(());
+        }
         let Some(message) = reassembler.push(header, chunk)? else {
             return Ok(());
         };
@@ -544,8 +561,10 @@ mod tests {
 
         channels.reset();
 
-        // A chunk with no FIRST after the reset is refused, which proves the
-        // reassembler forgot the message rather than continuing it.
+        // A chunk with no FIRST after the reset is dropped as an orphan, which
+        // proves the reassembler forgot the message rather than continuing
+        // it: continuing would have completed the 64 octets and handed a
+        // garbage message to the drdynvc handler, which reports or answers it.
         let mut cont = Vec::new();
         ChannelPduHeader {
             length: 64,
@@ -554,7 +573,44 @@ mod tests {
         .encode(&mut Writer::new(&mut cont))
         .expect("encodes");
         cont.extend_from_slice(&[0x22; 48]);
-        assert!(channels.deliver(1004, &cont, ctx(), &mut out).is_err());
+        channels
+            .deliver(1004, &cont, ctx(), &mut out)
+            .expect("an orphan chunk is dropped, not fatal");
+        assert!(out.events.is_empty(), "{:?}", out.events);
+        assert!(out.frames.is_empty(), "{:?}", out.frames);
+    }
+
+    /// A Fudo PAM gateway sends `cliprdr` chunks that neither start nor
+    /// continue a message (flags 0x0c080100). They are dropped, and a proper
+    /// message straight after still gets through.
+    #[test]
+    fn an_orphan_chunk_is_dropped_and_the_next_message_still_arrives() {
+        let mut channels = StaticChannels::new(&map());
+        let mut out = Outbox::new();
+
+        let mut orphan = Vec::new();
+        ChannelPduHeader {
+            length: 16,
+            flags: 0x0c08_0100,
+        }
+        .encode(&mut Writer::new(&mut orphan))
+        .expect("encodes");
+        orphan.extend_from_slice(&[0u8; 16]);
+        channels
+            .deliver(1006, &orphan, ctx(), &mut out)
+            .expect("an orphan chunk is dropped, not fatal");
+        assert!(out.frames.is_empty());
+
+        use crate::channels::cliprdr::msg_type;
+        for chunk in clip_chunks(msg_type::MONITOR_READY, 0, &[], CHANNEL_CHUNK_LENGTH) {
+            channels
+                .deliver(1006, &chunk, ctx(), &mut out)
+                .expect("a whole message after the orphan is accepted");
+        }
+        assert_eq!(
+            clip_types(&out),
+            [msg_type::CLIP_CAPS, msg_type::FORMAT_LIST]
+        );
     }
 
     /// One `cliprdr` message from the server, in as many chunks as it takes
