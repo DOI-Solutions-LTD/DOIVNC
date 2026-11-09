@@ -53,12 +53,15 @@
     "allow-delete-password",
     "allow-credential-backend",
     "allow-unlock-credentials",
+    "allow-credential-status",
 
     "allow-start-discovery",
     "allow-stop-discovery",
     "allow-scan-network",
+    "allow-stop-scan",
     "allow-deep-probe",
     "allow-local-subnets",
+    "allow-scan-networks",
     "allow-wake-host",
 
     "allow-connect-session",

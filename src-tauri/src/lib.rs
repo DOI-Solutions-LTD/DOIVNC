@@ -96,6 +96,18 @@ pub fn run() {
 
             let store = Arc::new(vnc_store::Store::open(Some(data_dir.clone()))?);
             let credentials = Arc::new(vnc_store::CredentialStore::new(data_dir.clone()));
+            // A save that has to wait for the encrypted file's master password
+            // is announced to every window, which asks the person once.
+            {
+                let handle = app.handle().clone();
+                credentials.set_locked_save_listener(Box::new(move |host_id| {
+                    use tauri::Emitter;
+                    let _ = handle.emit(
+                        commands::credentials::CREDENTIAL_STORE_LOCKED,
+                        serde_json::json!({ "hostId": host_id }),
+                    );
+                }));
+            }
             // The pin store is built first and shared, because three
             // features verify against it: the Files panel, the RFB tunnel and
             // the SSH protocol driver. One store is the invariant, so it is
@@ -207,6 +219,12 @@ pub fn run() {
                 // A destroyed window can never re-arm, so drop the intent too.
                 tauri::WindowEvent::Destroyed => {
                     commands::capture::release_for_window(window.app_handle(), window.label());
+                    // A scan whose window is gone has nobody left to show its
+                    // progress or to stop it. Destroyed rather than
+                    // CloseRequested, since a close can still be called off.
+                    if let Some(state) = window.try_state::<AppState>() {
+                        state.discovery.stop_scan_started_by(window.label());
+                    }
                 }
                 _ => {}
             }
@@ -245,12 +263,15 @@ pub fn run() {
             commands::credentials::delete_password,
             commands::credentials::credential_backend,
             commands::credentials::unlock_credentials,
+            commands::credentials::credential_status,
             // discovery
             commands::discovery::start_discovery,
             commands::discovery::stop_discovery,
             commands::discovery::scan_network,
+            commands::discovery::stop_scan,
             commands::discovery::deep_probe,
             commands::discovery::local_subnets,
+            commands::discovery::scan_networks,
             commands::discovery::wake_host,
             // sessions
             commands::session::connect_session,

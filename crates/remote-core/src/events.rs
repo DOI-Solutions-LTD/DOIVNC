@@ -130,6 +130,10 @@ pub enum SessionEvent {
         subject: String,
         is_change: bool,
         scheme: PinScheme,
+        /// The whole certificate's thumbprint and SHA-256, for a key that
+        /// came in an X.509 certificate (TLS, RDP, RD Gateway). Display only:
+        /// `fingerprint` is still what is pinned. `None` for a bare key (RA2).
+        certificate: Option<vnc_transport::CertificateDigests>,
     },
     /// The handshake needs credentials from the user. The session is PAUSED
     /// mid-authentication until `ProvideCredentials` or `CancelCredentials`
@@ -212,6 +216,17 @@ pub enum ProtocolEvent {
     Boundary {
         control: bool,
         tools: bool,
+    },
+    /// What a support session's computer lets this helper do with its
+    /// clipboard, sent when the computer first says and on every change.
+    /// `write`: text sent from here is put on that computer's clipboard
+    /// (true exactly while the helper has control). `read`: what the person
+    /// there copies is sent here (their own separate tick). A computer whose
+    /// support app predates clipboard over Boundary never sends this, and
+    /// both stay off.
+    BoundaryClipboard {
+        write: bool,
+        read: bool,
     },
     Rdp(RdpEvent),
     Ssh(SshEvent),

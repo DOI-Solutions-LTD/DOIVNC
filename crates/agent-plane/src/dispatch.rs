@@ -140,6 +140,20 @@ const ROOM_POLL: Duration = Duration::from_millis(5);
 /// the plane's own bookkeeping and never reaches a limb (`02 §2.4`).
 const WAIT_POLL: Duration = Duration::from_millis(50);
 
+/// The most a change may paint and still count as a blink for screen-stable.
+///
+/// A text caret blinks about every half second and a clock ticks, so a screen
+/// with either never went quiet: on a Windows desktop with PowerShell open
+/// every screen-stable wait ran to its timeout, 91 s of a 157 s install. A
+/// caret is a few hundred pixels and a tray clock a few thousand; a dialog,
+/// a menu or a line of output is far more than this.
+const BLINK_AREA: usize = 64 * 64;
+
+/// Is this change too small to mean the screen is still moving?
+fn is_blink(damage: &crate::perception::Damage) -> bool {
+    damage.rects.iter().map(|r| r.area()).sum::<usize>() <= BLINK_AREA
+}
+
 /// How long the plane waits for a driver's answer to a natively served intent
 /// when the agent named no deadline of its own.
 ///
@@ -1396,10 +1410,7 @@ impl AttachedLimb {
                 // which would be the plane inventing a value.
                 _ => Settlement::refuse(
                     id,
-                    Refusal::limb(
-                        RefusalCode::NotSupported,
-                        "this build's plane reads pixels and damage and is not handed a character grid; a text or cells read is owed by the terminal limb's own output path",
-                    ),
+                    Refusal::limb(RefusalCode::NotSupported, self.no_text_here()),
                 ),
             },
             IntentKind::Wait {
@@ -1438,6 +1449,22 @@ impl AttachedLimb {
         }
     }
 
+    /// Why a text read, or a text or exit condition, cannot be answered on
+    /// this limb, in the words that are true for what this limb is.
+    ///
+    /// A terminal limb used to be told it had "no character grid" and sent to
+    /// "the terminal limb on the same machine", which is itself. The grid a
+    /// terminal has lives in the window that draws it, and its output does not
+    /// reach this plane, so the sentence says that and names the tool that
+    /// does return a command's output.
+    fn no_text_here(&self) -> &'static str {
+        if self.inner.driver.perception().cells {
+            "this is a terminal limb, and its output is drawn in DeskVNCViewer's window and not handed to the agent plane in this build, so there is no text here to read or to wait for. Run the command with dvv_run instead: it opens a channel of its own and returns the whole output with the far side's exit status. dvv_term_send still types into this terminal"
+        } else {
+            "this limb is a desktop: it has no character grid and this build does no OCR, so a text read or a text or exit condition has no honest answer here. Look with dvv_screen, or run the command with dvv_run on an SSH limb for the same machine, which returns its output and its exit status"
+        }
+    }
+
     /// Wait for a condition, from the damage stream and the reported state.
     ///
     /// A timeout is an ORDINARY SETTLEMENT with what was observed, never an
@@ -1467,15 +1494,22 @@ impl AttachedLimb {
                         break true;
                     }
                 }
+                // A blink is not the effect of anything the agent did, so it
+                // does not answer "did my click do anything" either.
                 WaitUntil::ScreenChanged => {
                     if let Some(damage) = self.inner.observatory.damage_now() {
                         rects = rects.saturating_add(damage.rects.len() as u32);
-                        break true;
+                        if !is_blink(&damage) {
+                            break true;
+                        }
                     }
                 }
                 WaitUntil::ScreenStable | WaitUntil::Idle => {
-                    if let Some(damage) = self.inner.observatory.damage_now() {
+                    let damage = self.inner.observatory.damage_now();
+                    if let Some(damage) = &damage {
                         rects = rects.saturating_add(damage.rects.len() as u32);
+                    }
+                    if damage.as_ref().is_some_and(|d| !is_blink(d)) {
                         last_change = tokio::time::Instant::now();
                     } else if last_change.elapsed() >= quiet {
                         break true;
@@ -1497,10 +1531,7 @@ impl AttachedLimb {
                 WaitUntil::Text(_) | WaitUntil::TextGone(_) | WaitUntil::Exit | _ => {
                     return Settlement::refuse(
                         id,
-                        Refusal::limb(
-                            RefusalCode::NotSupported,
-                            "this limb has no character grid and this build does no OCR, so there is no honest way to answer a text or exit condition here; ask the terminal limb on the same machine",
-                        ),
+                        Refusal::limb(RefusalCode::NotSupported, self.no_text_here()),
                     )
                 }
             }

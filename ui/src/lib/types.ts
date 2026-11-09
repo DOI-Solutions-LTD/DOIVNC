@@ -249,6 +249,42 @@ export function parseSshTunnel(raw: string | null | undefined): SshTunnelSetting
 }
 
 /**
+ * The SSH login the Files panel and the toolbar terminal use on a graphical
+ * session. A host only records an SSH identity in its tunnel settings (the
+ * editor says the password there is shared with the Files panel), so when
+ * the profile has a tunnel blob whose gateway is this same computer, its
+ * port, user and auth are the login. A tunnel through some other gateway
+ * describes a login to that gateway, not to this machine, so it is not
+ * borrowed. Otherwise it is port 22 on the session's own address as the
+ * local user, with whatever SSH secret the keychain holds for the profile.
+ */
+export interface SideChannelLogin {
+  host: string;
+  port: number;
+  /** Empty means "the same user as here"; Rust fills it in. */
+  username: string;
+  auth: SshTunnelSettings["auth"];
+  keyPath: string | null;
+}
+
+export function sideChannelLogin(
+  address: string,
+  tunnel: SshTunnelSettings | null,
+): SideChannelLogin {
+  const gateway = tunnel?.host.trim() ?? "";
+  if (!tunnel || (gateway && gateway.toLowerCase() !== address.trim().toLowerCase())) {
+    return { host: address, port: 22, username: "", auth: "stored", keyPath: null };
+  }
+  return {
+    host: address,
+    port: tunnel.port,
+    username: tunnel.user.trim(),
+    auth: tunnel.auth,
+    keyPath: tunnel.auth === "key-file" ? tunnel.keyPath : null,
+  };
+}
+
+/**
  * Serialize for the `sshTunnel` column. A tunnel that was never enabled and
  * never edited stores `null`, keeping the column empty for the overwhelming
  * majority of hosts.
@@ -330,6 +366,9 @@ export interface StoredCredentials {
   rdpUser?: string | null;
   rdpDomain?: string | null;
   rdpPassword?: string | null;
+  /** The RD Gateway account's password, for a gateway that signs in with an
+   *  account of its own. */
+  rdgPassword?: string | null;
 }
 
 /** Where secrets live; mirrors `vnc_store::CredentialBackend`. */
@@ -481,12 +520,24 @@ export function hostMac(host: { mac?: string | null } | null | undefined): strin
  * crates/remote-core/src/pins.rs).
  *
  * "tls" is a VeNCrypt X.509 certificate, "ra2" a RealVNC RSA key, "rdp-tls"
- * an RDP server's own certificate. One host can offer all three, and the
+ * an RDP server's own certificate, "apple-rsa" a Mac's Screen Sharing host
+ * key. One host can offer all three, and the
  * fingerprints are unrelated, so a prompt says which one it is about and the
  * answer must carry the same value back untouched. This never reaches the
  * user; it is routing, not copy.
  */
-export type PinScheme = "tls" | "ra2" | "rdp-tls";
+export type PinScheme = "tls" | "ra2" | "rdp-tls" | "rdg-tls" | "apple-rsa";
+
+/**
+ * Digests of the whole certificate a server key came in, colon separated
+ * hex. `thumbprint` is the SHA-1 Windows shows as Thumbprint, `sha256` the
+ * certificate's SHA-256. Shown beside the pin for matching by eye; the pin
+ * itself is the SHA-256 of the public key and nothing here is pinned.
+ */
+export interface CertificateDigests {
+  thumbprint: string;
+  sha256: string;
+}
 
 /** SessionState mirrors the serde repr: tag = "state", kebab-case. */
 export type SessionState =
@@ -614,6 +665,7 @@ export interface DisplayOption extends RemoteScreen {
  */
 export type SessionEvent =
   | { type: "boundary-control"; control: boolean }
+  | { type: "boundary-clipboard"; write: boolean; read: boolean }
   | { type: "state-changed"; state: SessionState }
   | { type: "desktop-resize"; width: number; height: number }
   | { type: "desktop-name"; name: string }
@@ -628,6 +680,8 @@ export type SessionEvent =
       subject: string;
       isChange: boolean;
       scheme: PinScheme;
+      /** Null for a key that came without a certificate (RA2). */
+      certificate: CertificateDigests | null;
     }
   | { type: "credentials-required"; request: CredentialRequest }
   | { type: "stats"; stats: SessionStats }
@@ -675,4 +729,35 @@ export interface ScanProgress {
   running: boolean;
   done: number;
   total: number;
+  /** Stop was pressed and the scan has not reported its end yet. */
+  stopping?: boolean;
+}
+
+/** What kind of network `scan_networks` listed, in the order it lists them. */
+export type ScanNetworkKind = "lan" | "vpn" | "warp" | "routed" | "virtual";
+
+/** Whether a range may be scanned as it stands (`vnc_discovery::networks::RangeVerdict`). */
+export type RangeVerdict = "scan" | "confirm" | "too-large" | "public";
+
+/** One network this computer can scan, from `scan_networks`. */
+export interface ScanNetwork {
+  id: string;
+  /** "Ethernet (enp6s0)", "Cloudflare WARP". */
+  name: string;
+  kind: ScanNetworkKind;
+  interface: string;
+  /** One CIDR, or the enclosing /24 with ", part" when routes cover pieces of it. */
+  range: string;
+  /** What `scan_network` is given to scan this network. */
+  cidrs: string[];
+  /** Host addresses the scan would probe. */
+  addresses: number;
+  verdict: RangeVerdict;
+}
+
+/** A scan of named ranges rather than the default local subnets. */
+export interface ScanTarget {
+  cidrs: string[];
+  /** Sent only after the person confirmed a range larger than a /22. */
+  allowLarge: boolean;
 }

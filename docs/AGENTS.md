@@ -36,8 +36,11 @@ Three properties separate it from the version a person writes in an afternoon:
 
 - **stdio**, for agents that spawn a subprocess. This is the default. `dvv`
   reaches the application over a unix socket on macOS and Linux, and over a
-  named pipe on Windows (`\\.\pipe\deskvncviewer-agent-<user>`) whose ACL
-  admits only the user who started DeskVNCViewer.
+  named pipe on Windows (`\\.\pipe\deskvncviewer-agent-<user>-s<session>`)
+  whose ACL admits only the user who started DeskVNCViewer. There is one per
+  Windows session, so a viewer in an RDP login serves that login's agents and
+  the console's viewer serves the console's. A `dvv` started over SSH (session
+  0, where no viewer can run) reaches the console's.
 - **HTTP**, for agents that cannot. It is off by default, binds to loopback,
   always requires a bearer token, checks `Origin`, and refuses to start rather
   than start without a token.
@@ -53,6 +56,16 @@ installed on the computer (OpenCode, Pi, Claude Code and Codex) and connects
 each one to it. Then ask your agent to do something on one of your machines by
 name. It opens the machine itself, recovers it if the screen stalls, and starts
 DeskVNCViewer if it is closed.
+
+`dvv` starts the app only when an agent asks for something the app alone has:
+`dvv_hosts`, `dvv_open` or `dvv_group_open` (and `dvv hosts` and `dvv open` in
+a shell). It starts it minimised, without taking focus, at most once per `dvv`
+process. Starting `dvv mcp`, `initialize`, `tools/list`, `dvv_limbs` and every
+call on a limb never start it, so an MCP client that starts `dvv` with each
+session does not put a window on the screen, and a person who quits the app
+while an agent is connected sees it again only when that agent next asks for a
+machine. Set `DVV_NO_START=1` in the server's environment and `dvv` never
+starts it; the calls that need it then fail saying the app is not running.
 
 An agent installed after the app last started is picked up on the next launch,
 or straight away with **Connect now** in the AI Agents panel. An agent that was

@@ -24,7 +24,10 @@ pub struct Active {
     pub control: bool,
     /// Whether their tools may run commands and copy files.
     pub tools: bool,
-    /// What their tools did, newest last.
+    /// Whether they are shown what the person here copies.
+    pub clipboard: bool,
+    /// What their tools did, and clipboard text that went either way, newest
+    /// last.
     pub activity: Vec<String>,
     pub session: Session,
 }
@@ -35,6 +38,10 @@ pub struct Ask {
     peer: String,
     tools: bool,
     allow_tools: bool,
+    /// The helper can carry clipboard text, so the person is asked.
+    clipboard: bool,
+    /// Off until they tick it.
+    allow_clipboard: bool,
     pair: bool,
     answer: tokio::sync::oneshot::Sender<Asked>,
 }
@@ -50,6 +57,9 @@ pub struct Unattended {
     claim: Option<std::fs::File>,
     /// Helpers connected unattended now, in the order they came in.
     pub active: Vec<Active>,
+    /// How many helpers have connected unattended since the app started,
+    /// so the window can tell a new session from the same ones.
+    pub connections: u64,
     ask: Option<Ask>,
     reachable: bool,
     password: String,
@@ -61,14 +71,23 @@ pub struct Unattended {
     login: bool,
     /// Setting that up or taking it away, which waits on an administrator.
     login_change: Option<std::sync::mpsc::Receiver<(bool, Result<()>)>>,
+    /// The person said no to the notice offering the copy at the sign in
+    /// screen, or took that copy away themselves.
+    login_notice_dismissed: bool,
     /// Not listening for now, because another copy is: the one at the sign
     /// in or lock screen. Picked up again when it hands over.
     handed_over: bool,
     checked: std::time::Instant,
+    /// The window, woken when the listener has something to say.
+    ctx: egui::Context,
 }
 
 impl Unattended {
-    pub fn new() -> Self {
+    /// Whether a helper who is not paired is waiting for an answer.
+    pub fn asking(&self) -> bool {
+        self.ask.is_some()
+    }
+    pub fn new(ctx: &egui::Context) -> Self {
         let mut this = Self {
             access_path: PathBuf::new(),
             machine: String::new(),
@@ -77,6 +96,7 @@ impl Unattended {
             listener: None,
             claim: None,
             active: Vec::new(),
+            connections: 0,
             ask: None,
             reachable: false,
             password: String::new(),
@@ -86,8 +106,10 @@ impl Unattended {
             autostart: autostart::enabled(),
             login: crate::login::enabled(),
             login_change: None,
+            login_notice_dismissed: notice_dismissed(),
             handed_over: false,
             checked: std::time::Instant::now(),
+            ctx: ctx.clone(),
         };
         // Rewrite an existing sign in entry, so one written by an older copy
         // picks up what this one adds (a restart after a crash on macOS) and
@@ -160,14 +182,20 @@ impl Unattended {
                 return;
             }
         }
-        self.listener = Some(unattended::listen(
+        let mut listener = unattended::listen(
             boundary_session::HostOptions::default(),
             key,
             self.access_path.clone(),
             // The primary display, found when a helper arrives: nobody is
             // there to pick another, and a sleeping screen lists none now.
             boundary_platform::open_primary,
-        ));
+        );
+        // A helper asking to come in wakes the window, which otherwise draws
+        // nothing while it waits.
+        let (_, stand_in) = tokio::sync::mpsc::channel(1);
+        let notices = std::mem::replace(&mut listener.notices, stand_in);
+        listener.notices = crate::wake::relay(notices, self.ctx.clone());
+        self.listener = Some(listener);
         self.say("Starting unattended access");
     }
     fn halt(&mut self) {
@@ -199,17 +227,31 @@ impl Unattended {
     }
     /// Let the helper of the current attended session in any time, and tell
     /// them this computer's ID so they can save it.
-    pub fn pair(&mut self, session: &Session, peer: &str, name: &str, tools: bool) {
+    /// What they may do later starts as what they may do now, so `tools`
+    /// and `clipboard` are what the person allows in this session.
+    pub fn pair(
+        &mut self,
+        session: &Session,
+        peer: &str,
+        name: &str,
+        tools: bool,
+        clipboard: bool,
+    ) {
         if let Err(error) = self.access.trust(peer, name, true) {
             self.fail(format!("{error:#}"));
             return;
         }
         self.access.allow_tools(peer, tools);
+        self.access.allow_clipboard(peer, clipboard);
+        let was_enabled = self.access.enabled;
         self.access.enabled = true;
         if !self.save() {
             return;
         }
         self.start();
+        if !was_enabled {
+            self.reachable_before_sign_in();
+        }
         match session.offer_pairing(self.machine.clone(), computer_name()) {
             Ok(()) => self.say(format!(
                 "{name} can now connect to this computer any time. Remove them under Unattended access to stop it"
@@ -223,13 +265,18 @@ impl Unattended {
     pub fn enabled(&self) -> bool {
         self.access.enabled
     }
+    /// Whether the window has to look once a second for the lock screen
+    /// copy to hand the ID back, which sends no event.
+    pub fn needs_checks(&self) -> bool {
+        self.access.enabled && (self.login || self.handed_over)
+    }
     /// This computer's lasting ID, the one a helper saves.
     pub fn machine_id(&self) -> &str {
         &self.machine
     }
-    /// Whether the listener has confirmed it can be found by that ID.
-    pub fn reachable(&self) -> bool {
-        self.reachable
+    /// The word beside "Unattended access" on the home screen.
+    pub fn label(&self) -> &'static str {
+        label(self.access.enabled, self.reachable, self.handed_over)
     }
     /// Drain the listener. `true` when a helper has just come in, so the
     /// caller brings the window forward.
@@ -261,10 +308,16 @@ impl Unattended {
                         ..
                     } => {
                         log(&self.access_path, &format!("{name} connected"));
+                        self.connections += 1;
+                        if let Some(message) = after_connect(&self.message, &name) {
+                            self.message = message;
+                            self.error = false;
+                        }
                         self.active.push(Active {
                             name,
                             control,
                             tools: session.tools_allowed(),
+                            clipboard: session.clipboard_read_allowed(),
                             activity: Vec::new(),
                             session,
                         });
@@ -275,6 +328,7 @@ impl Unattended {
                         name,
                         peer,
                         tools,
+                        clipboard,
                         answer,
                     } => {
                         self.ask = Some(Ask {
@@ -282,6 +336,8 @@ impl Unattended {
                             peer,
                             tools,
                             allow_tools: false,
+                            clipboard,
+                            allow_clipboard: false,
                             pair: false,
                             answer,
                         });
@@ -370,6 +426,11 @@ impl Unattended {
                     );
                     theme::small(ui, "Their tools act as you, outside what the screen shows. Leave this off unless you asked for it.");
                 }
+                if ask.clipboard {
+                    ui.add_space(10.0);
+                    ui.checkbox(&mut ask.allow_clipboard, crate::SEE_WHAT_I_COPY);
+                    theme::small(ui, crate::SEE_WHAT_I_COPY_NOTE);
+                }
                 ui.add_space(6.0);
                 ui.checkbox(
                     &mut ask.pair,
@@ -392,18 +453,18 @@ impl Unattended {
                 });
                 if !control_ok {
                     theme::small(ui, "Accessibility permission is needed for control. You can allow viewing now.");
+                } else if let Some(hint) = boundary_platform::control_hint() {
+                    theme::small(ui, hint);
                 }
             });
         if let Some(approval) = decision
             && let Some(ask) = self.ask.take()
         {
             let allowed = !matches!(approval, Approval::Deny);
-            let _ = ask.answer.send(Asked {
-                approval,
-                tools: allowed && ask.allow_tools,
-                pair: allowed && ask.pair,
-            });
-            if allowed && ask.pair {
+            let pair = allowed && ask.pair;
+            let asked = answer(&ask, approval);
+            let _ = ask.answer.send(asked);
+            if pair {
                 // The listener saved them; show the list as it now is.
                 if let Ok(access) = Access::load(&self.access_path) {
                     self.access = access;
@@ -414,12 +475,55 @@ impl Unattended {
     /// A banner for each helper connected unattended, shown on top of
     /// everything. The person at the computer always sees who is in and can
     /// end any of them with one click.
+    /// Offer the copy at the sign in screen when unattended access is on and
+    /// that copy is missing, which is how a computer that switched unattended
+    /// access on before it was set up automatically finds itself after an
+    /// upgrade. Only the button asks for an administrator: Support never
+    /// raises an administrator prompt on its own when it starts.
+    pub fn login_notice(&mut self, ui: &mut egui::Ui) {
+        if !show_login_notice(
+            crate::login::SUPPORTED,
+            self.access.enabled,
+            self.login,
+            self.login_notice_dismissed,
+            self.login_change.is_some(),
+        ) {
+            return;
+        }
+        theme::card(ui, |ui| {
+            ui.label(
+                egui::RichText::new("Unattended access stops when this computer restarts").strong(),
+            );
+            theme::muted(
+                ui,
+                "Until somebody signs in, paired helpers cannot reach it. Setting that up asks for an administrator once.",
+            );
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                if ui.button("Set it up").clicked() {
+                    self.set_login(true);
+                }
+                if ui.button("Not now").clicked() {
+                    self.dismiss_login_notice();
+                }
+            });
+        });
+        ui.add_space(10.0);
+    }
+    fn dismiss_login_notice(&mut self) {
+        self.login_notice_dismissed = true;
+        if let Some(path) = notice_path() {
+            let _ = std::fs::write(path, b"");
+        }
+    }
     pub fn banner(&mut self, ui: &mut egui::Ui) {
         let mut end = None;
         let mut stop_tools = None;
+        let mut stop_clipboard = None;
         for (index, active) in self.active.iter().enumerate() {
             let name = &active.name;
             let tools = active.tools;
+            let clipboard = active.clipboard;
             egui::Frame::new()
                 .fill(theme::pal(ui.ctx()).danger)
                 .inner_margin(14.0)
@@ -445,6 +549,9 @@ impl Unattended {
                             if tools && ui.button("Stop their commands").clicked() {
                                 stop_tools = Some(index);
                             }
+                            if clipboard && ui.button("Stop showing what I copy").clicked() {
+                                stop_clipboard = Some(index);
+                            }
                         });
                     });
                     if tools {
@@ -453,6 +560,12 @@ impl Unattended {
                                 "Their tools can run commands and copy files on this computer.",
                             )
                             .color(egui::Color32::WHITE),
+                        );
+                    }
+                    if clipboard {
+                        ui.label(
+                            egui::RichText::new("They see the text you copy on this computer.")
+                                .color(egui::Color32::WHITE),
                         );
                     }
                     for line in &active.activity {
@@ -471,6 +584,14 @@ impl Unattended {
             let name = active.name.clone();
             self.say(format!(
                 "{name}'s tools can no longer run commands in this session"
+            ));
+        }
+        if let Some(active) = stop_clipboard.and_then(|i| self.active.get_mut(i)) {
+            active.session.set_clipboard_read(false);
+            active.clipboard = false;
+            let name = active.name.clone();
+            self.say(format!(
+                "{name} no longer sees what you copy in this session"
             ));
         }
         if let Some(index) = end.filter(|&i| i < self.active.len()) {
@@ -496,6 +617,7 @@ impl Unattended {
             if self.save() {
                 if enabled {
                     self.start();
+                    self.reachable_before_sign_in();
                 } else {
                     self.halt();
                     self.say("Unattended access is off. Nobody can connect without your approval");
@@ -524,7 +646,7 @@ impl Unattended {
         if ui
             .checkbox(
                 &mut autostart,
-                "Start Boundary when I sign in, so it is ready",
+                "Start DeskVNC Support when I sign in, so it is ready",
             )
             .changed()
         {
@@ -554,6 +676,10 @@ impl Unattended {
                 changed |= ui
                     .checkbox(&mut helper.tools, "may run commands and copy files")
                     .on_hover_text("For a helper whose tools, such as DeskVNC's agents, work on this computer while you are away. Commands run as you.")
+                    .changed();
+                changed |= ui
+                    .checkbox(&mut helper.clipboard, "may see what I copy")
+                    .on_hover_text("Text copied on this computer while they are connected goes to them, and that is sometimes a password. Never at the sign in screen.")
                     .changed();
                 if ui.button("Remove").clicked() {
                     remove = Some(index);
@@ -633,6 +759,10 @@ impl Unattended {
                 Ok((on, Ok(()))) => {
                     self.login = on;
                     self.login_change = None;
+                    // Taken away on purpose: the notice would only ask again.
+                    if !on {
+                        self.dismiss_login_notice();
+                    }
                     self.say(if on {
                         "Paired helpers can now connect at the sign in screen too"
                     } else {
@@ -662,20 +792,70 @@ impl Unattended {
             .on_hover_text("Asks for an administrator. At the sign in screen only paired helpers and the unattended password get in, and helpers' tools cannot run commands.")
             .changed();
         if changed {
-            // The app in the tray takes over once somebody signs in.
-            if login && !self.autostart && autostart::set(true).is_ok() {
-                self.autostart = true;
-            }
-            let (tx, rx) = std::sync::mpsc::channel();
-            let ctx = ui.ctx().clone();
-            std::thread::spawn(move || {
-                let _ = tx.send((login, crate::login::set(login)));
-                ctx.request_repaint();
-            });
-            self.login_change = Some(rx);
-            self.say("Waiting for an administrator to allow it");
+            self.set_login(login);
         }
     }
+    /// Set the copy at the sign in screen up, or take it away, on a thread,
+    /// since it waits for an administrator.
+    fn set_login(&mut self, on: bool) {
+        if !crate::login::SUPPORTED || self.login_change.is_some() {
+            return;
+        }
+        // The app in the tray takes over once somebody signs in.
+        if on && !self.autostart && autostart::set(true).is_ok() {
+            self.autostart = true;
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send((on, crate::login::set(on)));
+        });
+        self.login_change = Some(rx);
+        self.say("Waiting for an administrator to allow it");
+    }
+    /// Unattended access that stops at a restart until somebody signs in is
+    /// not what anyone switching it on expects, so switching it on sets up
+    /// the copy at the sign in screen too. The checkbox below still turns
+    /// that part off.
+    fn reachable_before_sign_in(&mut self) {
+        if !self.login {
+            self.set_login(true);
+        }
+    }
+}
+
+/// Whether to offer setting up the copy at the sign in screen.
+/// The person's answer to a helper who is not paired: nothing beyond
+/// viewing and control unless they ticked it, and nothing at all when they
+/// declined.
+fn answer(ask: &Ask, approval: Approval) -> Asked {
+    let allowed = !matches!(approval, Approval::Deny);
+    Asked {
+        approval,
+        tools: allowed && ask.tools && ask.allow_tools,
+        clipboard: allowed && ask.clipboard && ask.allow_clipboard,
+        pair: allowed && ask.pair,
+    }
+}
+fn show_login_notice(
+    supported: bool,
+    unattended_on: bool,
+    copy_present: bool,
+    dismissed: bool,
+    changing: bool,
+) -> bool {
+    supported && unattended_on && !copy_present && !dismissed && !changing
+}
+
+/// The empty file that remembers the notice was answered with Not now. It
+/// sits beside the machine ID and is never part of `access.json`.
+fn notice_path() -> Option<PathBuf> {
+    boundary_provision::platform::data_dir()
+        .ok()
+        .map(|dir| dir.join("sign-in-screen-notice-dismissed"))
+}
+
+fn notice_dismissed() -> bool {
+    notice_path().is_some_and(|path| path.exists())
 }
 
 /// Whether this session is on the physical screen and locked.
@@ -693,6 +873,30 @@ fn screen_locked() -> bool {
 fn log(access_path: &std::path::Path, line: &str) {
     if let Some(dir) = access_path.parent() {
         crate::journal::note(dir, "unattended.log", line);
+    }
+}
+
+/// The state of unattended access in a word or two.
+///
+/// When DeskVNC, or the copy at the sign in or lock screen, holds the claim,
+/// this app does not listen and never becomes reachable itself, but helpers
+/// still get in through that copy, so it is on.
+/// What the unattended status says once `name` connects, when what it said
+/// before is about their last session ending. A helper whose link dropped
+/// comes straight back, and "Helper stopped responding" stayed under their
+/// banner for as long as the new session ran. `None` keeps what it says.
+fn after_connect(message: &str, name: &str) -> Option<String> {
+    message
+        .starts_with(&format!("{name}'s session ended"))
+        .then(|| format!("{name} connected again"))
+}
+
+fn label(enabled: bool, reachable: bool, handed_over: bool) -> &'static str {
+    match (enabled, reachable, handed_over) {
+        (false, _, _) => "Off",
+        (true, true, _) => "On",
+        (true, false, true) => "On, answered by DeskVNC",
+        (true, false, false) => "Starting",
     }
 }
 
@@ -731,5 +935,207 @@ pub mod autostart {
             "Move DeskVNC Support to Applications first, so it can start when you sign in"
         );
         autostart::set(ENTRY, on)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Ask, after_connect, answer, label, show_login_notice};
+    use boundary_session::{
+        Approval,
+        unattended::{Access, Helper},
+    };
+
+    fn knock(clipboard: bool) -> Ask {
+        Ask {
+            name: "Sam".into(),
+            peer: "peer".into(),
+            tools: false,
+            allow_tools: false,
+            clipboard,
+            allow_clipboard: false,
+            pair: false,
+            answer: tokio::sync::oneshot::channel().0,
+        }
+    }
+
+    #[test]
+    fn a_helper_asking_by_id_sees_nothing_copied_unless_the_person_ticks_it() {
+        let mut ask = knock(true);
+        assert!(!answer(&ask, Approval::Control).clipboard);
+        ask.allow_clipboard = true;
+        assert!(answer(&ask, Approval::View).clipboard);
+        assert!(!answer(&ask, Approval::Deny).clipboard);
+        let mut old = knock(false);
+        old.allow_clipboard = true;
+        assert!(!answer(&old, Approval::Control).clipboard);
+    }
+
+    struct Fake;
+    impl boundary_session::Desktop for Fake {
+        fn capture(&mut self) -> anyhow::Result<boundary_session::Frame> {
+            Ok(boundary_session::Frame {
+                width: 2,
+                height: 2,
+                rgba: vec![200; 16],
+            })
+        }
+        fn input(&mut self, _: boundary_session::Input) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn release(&mut self) {}
+        fn has_clipboard(&self) -> bool {
+            true
+        }
+    }
+
+    /// Whether a paired helper allowed to see what is copied, connecting as
+    /// this app does, is let see it by a listener at the sign in screen
+    /// (`login`) or in a signed in session.
+    async fn sees_copies(login: bool) -> bool {
+        use boundary_session::unattended::{self as u, Notice};
+        let dir = std::env::temp_dir().join(format!(
+            "support-clipboard-{}-{login}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let machine = u::load_or_create_key(&dir.join("machine.key")).unwrap();
+        let friend = u::load_or_create_key(&dir.join("friend.key")).unwrap();
+        let access_path = dir.join("access.json");
+        let mut access = Access::default();
+        access.enabled = true;
+        let id = friend.public().to_string();
+        access.trust(&id, "Friend", true).unwrap();
+        access.allow_clipboard(&id, true);
+        access.save(&access_path).unwrap();
+        let local = boundary_session::HostOptions {
+            relay: false,
+            relay_url: None,
+            bind_ip: None,
+        };
+        let desktop = || Ok(Box::new(Fake) as Box<dyn boundary_session::Desktop>);
+        let mut listener = if login {
+            u::listen_at_login(local.clone(), machine, access_path, desktop)
+        } else {
+            u::listen(local.clone(), machine, access_path, desktop)
+        };
+        let address = loop {
+            match listener.notices.recv().await {
+                Some(Notice::Ready { address, .. }) => break address,
+                Some(Notice::Finished(result)) => panic!("listener ended: {result:?}"),
+                _ => {}
+            }
+        };
+        let _helper = u::connect_to_with(
+            Ok(address),
+            "Friend".into(),
+            None,
+            friend,
+            local,
+            crate::abilities(),
+        );
+        let seen = loop {
+            match listener.notices.recv().await {
+                Some(Notice::Connected { session, .. }) => break session.clipboard_read_allowed(),
+                Some(Notice::Refused { reason, .. }) => panic!("refused: {reason}"),
+                Some(Notice::Finished(result)) => panic!("listener ended: {result:?}"),
+                _ => {}
+            }
+        };
+        let _ = std::fs::remove_dir_all(&dir);
+        seen
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_sign_in_screen_never_shows_a_helper_what_is_copied() {
+        // On Windows a listener on the machine's own addresses raises a
+        // firewall prompt for each test build, as boundary-session's own
+        // unattended tests note.
+        if cfg!(windows) && std::env::var_os("BOUNDARY_LAN_TESTS").is_none() {
+            return;
+        }
+        let wait = std::time::Duration::from_secs(60);
+        // The same helper, with the same saved setting, sees copies once
+        // somebody has signed in, so the check below is not empty.
+        let signed_in = tokio::time::timeout(wait, sees_copies(false))
+            .await
+            .expect("timed out");
+        assert!(signed_in, "the person allowed it for this helper");
+        let at_login = tokio::time::timeout(wait, sees_copies(true))
+            .await
+            .expect("timed out");
+        assert!(
+            !at_login,
+            "nobody signed in is there to copy anything for them"
+        );
+    }
+
+    #[test]
+    fn saved_helpers_do_not_see_what_is_copied_until_the_person_says_so() {
+        // An access file written before the setting existed.
+        let old: Access = serde_json::from_str(
+            r#"{"enabled":true,"helpers":[{"id":"x","name":"Sam","control":true,"tools":true,"added":1}]}"#,
+        )
+        .unwrap();
+        assert!(!old.helpers[0].clipboard);
+        // A helper paired now starts with it off too.
+        let mut access = Access::default();
+        let id = boundary_session::unattended::machine_id(
+            &boundary_session::unattended::SecretKey::generate(),
+        );
+        access.trust(&id, "Sam", true).unwrap();
+        let Helper { clipboard, .. } = &access.helpers[0];
+        assert!(!clipboard);
+        assert!(access.allow_clipboard(&id, true));
+        assert!(access.helpers[0].clipboard);
+    }
+
+    #[test]
+    fn a_helper_coming_back_clears_the_news_of_their_last_session_ending() {
+        // What the listener said when the helper's link went quiet.
+        let ended = "Drive helper's session ended: Helper stopped responding: deadline has elapsed";
+        assert_eq!(
+            after_connect(ended, "Drive helper").as_deref(),
+            Some("Drive helper connected again")
+        );
+        // Anything else, or another helper's session, stays as it was.
+        assert_eq!(after_connect(ended, "Sam"), None);
+        assert_eq!(
+            after_connect(
+                "Port 5940 is taken, so helpers must connect by machine ID",
+                "Drive helper"
+            ),
+            None
+        );
+        assert_eq!(after_connect("", "Drive helper"), None);
+    }
+
+    #[test]
+    fn the_sign_in_screen_notice_shows_only_while_the_copy_is_missing() {
+        // Unattended on and no copy at the sign in screen: offer it.
+        assert!(show_login_notice(true, true, false, false, false));
+        // The copy is there, or the person said Not now: say nothing.
+        assert!(!show_login_notice(true, true, true, false, false));
+        assert!(!show_login_notice(true, true, false, true, false));
+        // Unattended off, a platform with no sign in screen copy, or the
+        // administrator prompt already open: nothing to offer.
+        assert!(!show_login_notice(true, false, false, false, false));
+        assert!(!show_login_notice(false, true, false, false, false));
+        assert!(!show_login_notice(true, true, false, false, true));
+    }
+
+    #[test]
+    fn another_copy_answering_is_not_shown_as_starting() {
+        // DeskVNC, or the copy at the sign in screen, holds the claim, so
+        // this app never listens. It used to say Starting for as long as
+        // that copy ran, which read as stuck.
+        assert_eq!(label(true, false, true), "On, answered by DeskVNC");
+        assert_eq!(label(true, false, false), "Starting");
+        assert_eq!(label(true, true, false), "On");
+        assert_eq!(label(false, false, false), "Off");
     }
 }

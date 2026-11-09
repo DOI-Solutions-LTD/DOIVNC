@@ -56,6 +56,11 @@ pub mod codes {
     /// and carried through here unchanged, so the sentence an agent reads is
     /// the one written where both numbers live.
     pub const SCREEN_CHANGED: &str = "SCREEN_CHANGED";
+    /// Every limb this agent may drive at once is attached, and each one is
+    /// a limb it opened or is driving.
+    pub const TOO_MANY_LIMBS: &str = "TOO_MANY_LIMBS";
+    /// The application's mirror budget refused a framebuffer mirror.
+    pub const BUDGET_REFUSED: &str = "BUDGET_REFUSED";
 }
 
 /// A tool execution error: something the model can read and self correct from.
@@ -113,7 +118,7 @@ impl From<PlaneError> for ToolError {
     /// rewritten here and nothing can be softened on the way out.
     fn from(error: PlaneError) -> ToolError {
         let code = match &error {
-            PlaneError::TooManyLimbs { .. } => "RATE_LIMITED",
+            PlaneError::TooManyLimbs { .. } => codes::TOO_MANY_LIMBS,
             PlaneError::HostNotInGrant { .. } | PlaneError::MissingCapability { .. } => {
                 codes::POLICY_DENIED
             }
@@ -201,11 +206,17 @@ pub fn hint_for(code: &str) -> &'static str {
         "NOT_EXPRESSIBLE" => {
             "The wire cannot carry what you asked for and the plane will not invent a conversion. The message says what it can carry instead."
         }
+        "TOO_MANY_LIMBS" => {
+            "Every limb this agent may drive at once is attached. Call dvv_close on a limbId you are finished with, then try again. Closing a limb the person opened only detaches it: their session stays open."
+        }
         "SLOT_REFUSED" => {
             "This protocol will not give you that many concurrent sessions against one machine. Use slot 0, which attaches to whatever is already open."
         }
         "NO_NATIVE_VARIANT" => {
             "The limb serves this intent itself and the wire variant that would carry it does not exist in this build. Do not retry. Use dvv_term_send, which lowers to bytes that do exist."
+        }
+        "SENSE_ABSENT" => {
+            "dvv_plan reads the screen through deskvnc-sense on the remote machine, and none is reachable. Start it there with DESKVNC_SENSE_TOKEN set and --connect pointing at this dvv's DESKVNC_SENSE_LISTEN address, or drive the machine step by step with dvv_key, dvv_type and dvv_click."
         }
         "BAD_REQUEST" => {
             "The arguments do not describe a call this tool can make. The message says which one is wrong."
@@ -256,6 +267,7 @@ mod tests {
             "UNKNOWN_KEY",
             "NOT_EXPRESSIBLE",
             "NO_NATIVE_VARIANT",
+            "TOO_MANY_LIMBS",
         ] {
             let hint = hint_for(code);
             assert!(hint.len() > 40, "{code} has a hint too short to be advice");

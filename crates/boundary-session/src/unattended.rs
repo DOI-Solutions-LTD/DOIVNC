@@ -92,6 +92,12 @@ pub struct Helper {
     /// before it existed.
     #[serde(default)]
     pub tools: bool,
+    /// Whether they see what the person copies while they are connected.
+    /// Off unless the person turned it on for this helper, including for
+    /// every helper paired before it existed, and always off at the sign in
+    /// screen.
+    #[serde(default)]
+    pub clipboard: bool,
     /// Unix seconds.
     pub added: u64,
 }
@@ -127,6 +133,7 @@ impl Access {
             name: name.trim().to_string(),
             control,
             tools: false,
+            clipboard: false,
             added: wire::now(),
         });
         Ok(())
@@ -137,6 +144,17 @@ impl Access {
         match self.helpers.iter_mut().find(|h| h.id == id.trim()) {
             Some(helper) => {
                 helper.tools = allowed;
+                true
+            }
+            None => false,
+        }
+    }
+    /// Let a paired helper see what the person copies, or stop it. `false`
+    /// when no helper has that ID.
+    pub fn allow_clipboard(&mut self, id: &str, allowed: bool) -> bool {
+        match self.helpers.iter_mut().find(|h| h.id == id.trim()) {
+            Some(helper) => {
+                helper.clipboard = allowed;
                 true
             }
             None => false,
@@ -198,6 +216,8 @@ pub struct Asked {
     pub approval: Approval,
     /// Let their tools run commands and copy files.
     pub tools: bool,
+    /// Let them see what the person copies.
+    pub clipboard: bool,
     /// Pair them, so they come in later without asking.
     pub pair: bool,
 }
@@ -228,6 +248,9 @@ pub enum Notice {
         peer: String,
         /// The helper can send commands and file requests.
         tools: bool,
+        /// The helper can carry clipboard text, so the person can be asked
+        /// whether it may see what they copy.
+        clipboard: bool,
         answer: tokio::sync::oneshot::Sender<Asked>,
     },
     /// A helper was turned away, and why.
@@ -320,7 +343,10 @@ where
 {
     let machine = machine_id(&key);
     let endpoint = session::endpoint_with(&options, Some(key), Lookup::Publish).await?;
-    let _close = Closing(endpoint.clone());
+    // A helper being served holds a seat until it has been told how its
+    // session ended, so the endpoint closes only after that.
+    let seats = Arc::new(tokio::sync::Semaphore::new(MAX_HELPERS));
+    let _close = Closing(endpoint.clone(), seats.clone());
     // Say which computer this is to a helper that dialled the address. On
     // the random port of a machine that could not have the usual one this
     // costs nothing and still serves a helper told the port.
@@ -362,113 +388,203 @@ where
         })
         .await
         .map_err(|_| anyhow!("Nobody is listening for notices"))?;
-    let mut throttle = Throttle::default();
-    let seats = Arc::new(tokio::sync::Semaphore::new(MAX_HELPERS));
+    let door = Arc::new(Door {
+        notices: notices.clone(),
+        stop: stop.clone(),
+        access_path: access_path.to_path_buf(),
+        login,
+        desktop,
+        throttle: tokio::sync::Mutex::new(Throttle::default()),
+        seats,
+        asking: Arc::new(tokio::sync::Mutex::new(())),
+    });
     loop {
         let incoming = endpoint.accept().await.context("The listener closed")?;
-        let knock = async {
-            let connection = incoming.await?;
-            let (send, mut recv) = connection.accept_bi().await?;
-            let message: Message = wire::read(&mut recv).await?;
-            Ok::<_, anyhow::Error>((connection, send, recv, message))
-        };
-        let Ok(Ok((connection, send, recv, message))) =
-            tokio::time::timeout(Duration::from_secs(5), knock).await
-        else {
-            continue;
-        };
-        let peer = connection.remote_id().to_string();
-        let Message::Knock {
-            version: 2,
-            name,
-            password,
-            tools,
-            jpeg,
-            tiles,
-            video,
-        } = message
-        else {
-            refuse(connection, send, "This computer accepts only unattended connections on this ID. Ask for an invitation instead".into());
-            continue;
-        };
-        let name =
-            if !name.trim().is_empty() && name.len() <= 80 && !name.chars().any(char::is_control) {
-                name.trim().to_string()
-            } else {
-                "Unnamed helper".to_string()
-            };
-        let decision = match Access::load(access_path) {
-            Ok(access) => authorize(&access, &peer, password.as_deref(), &mut throttle).await,
-            Err(error) => Decision::Refuse(format!("{error:#}")),
-        };
-        let decision = match decision {
-            Decision::Ask if login => Decision::Refuse(
-                "Nobody has signed in on that computer, so nobody can approve you. Ask to be paired, or use its unattended password".into(),
-            ),
-            Decision::Ask => ask(notices, access_path, &name, &peer, tools).await,
-            other => other,
-        };
-        let tools = tools && !login;
-        let (control, allowed_tools) = match decision {
-            Decision::Grant(control, tools) => (control, tools),
-            Decision::Ask => unreachable!("answered above"),
-            Decision::Refuse(reason) => {
-                refuse(connection, send, reason.clone());
-                let _ = notices.send(Notice::Refused { name, peer, reason }).await;
-                continue;
-            }
-        };
-        let Ok(seat) = seats.clone().try_acquire_owned() else {
-            let reason = format!(
-                "That computer already has {MAX_HELPERS} helpers connected. Try again when one leaves"
-            );
-            refuse(connection, send, reason.clone());
-            let _ = notices.send(Notice::Refused { name, peer, reason }).await;
-            continue;
-        };
-        let (session, mut worker) = session::channels();
-        worker.tools_tx.send_replace(tools && allowed_tools);
-        let desktop = desktop.clone();
-        // The session ends when whoever holds it lets go, or when this
-        // listener stops: either cancels the same token.
-        let ended = session.cancel_token();
-        notices
-            .send(Notice::Connected {
-                name: name.clone(),
-                peer: peer.clone(),
-                control,
-                session,
-            })
-            .await
-            .map_err(|_| anyhow!("Nobody is listening for notices"))?;
-        // Each helper is served on its own, so a second one is answered while
-        // the first is still in, instead of finding the computer silent.
+        // Each knock is read, checked and asked about on its own, so one
+        // that is slow to speak, or one the person is still deciding about,
+        // leaves the computer answering everyone else.
+        let door = door.clone();
         let stop = stop.clone();
-        let notices = notices.clone();
         tokio::spawn(async move {
-            let _seat = seat;
-            let result = tokio::select! {
-                _ = stop.cancelled() => Ok(()),
-                _ = ended.cancelled() => Ok(()),
-                result = session::serve(&mut worker, &connection, send, recv, peer, control, tools, wire::Screens::from_hello(jpeg, tiles, &video), move || desktop()) => result,
-            };
-            session::close_served(&connection, &result);
-            // Whoever holds the session hears that it ended, so a banner
-            // saying the helper is in does not outlive the helper.
-            let reason = result.as_ref().err().map(|error| format!("{error:#}"));
-            let _ = worker
-                .emit(Event::Finished(match &reason {
-                    Some(reason) => Err(anyhow!("{reason}")),
-                    None => Ok(()),
-                }))
-                .await;
-            if let Some(reason) = reason {
-                let _ = notices
-                    .send(Notice::Status(format!("{name}'s session ended: {reason}")))
-                    .await;
+            tokio::select! {
+                _ = stop.cancelled() => {}
+                _ = knock(door, incoming) => {}
             }
         });
     }
+}
+
+/// What every knock on an unattended computer shares.
+struct Door<F> {
+    notices: mpsc::Sender<Notice>,
+    stop: CancellationToken,
+    access_path: PathBuf,
+    login: bool,
+    desktop: Arc<F>,
+    /// Wrong passwords, counted across every helper.
+    throttle: tokio::sync::Mutex<Throttle>,
+    seats: Arc<tokio::sync::Semaphore>,
+    /// Held while the person is asked about a helper. They answer one at a
+    /// time, so a second helper is told they are busy rather than given a
+    /// prompt that would replace the first under their hand.
+    asking: Arc<tokio::sync::Mutex<()>>,
+}
+
+async fn knock<F>(door: Arc<Door<F>>, incoming: iroh::endpoint::Incoming)
+where
+    F: Fn() -> Result<Box<dyn Desktop>> + Send + Sync + 'static,
+{
+    let Door {
+        notices,
+        stop,
+        access_path,
+        login,
+        desktop,
+        throttle,
+        seats,
+        asking,
+    } = &*door;
+    let login = *login;
+    let knock = async {
+        let connection = incoming.await?;
+        let (send, mut recv) = connection.accept_bi().await?;
+        let message: Message = wire::read(&mut recv).await?;
+        Ok::<_, anyhow::Error>((connection, send, recv, message))
+    };
+    let Ok(Ok((connection, send, recv, message))) =
+        tokio::time::timeout(Duration::from_secs(5), knock).await
+    else {
+        return;
+    };
+    let peer = connection.remote_id().to_string();
+    let Message::Knock {
+        version: 2,
+        name,
+        password,
+        tools,
+        jpeg,
+        tiles,
+        video,
+        clipboard,
+    } = message
+    else {
+        refuse(connection, send, "This computer accepts only unattended connections on this ID. Ask for an invitation instead".into());
+        return;
+    };
+    let name = if !name.trim().is_empty() && name.len() <= 80 && !name.chars().any(char::is_control)
+    {
+        name.trim().to_string()
+    } else {
+        "Unnamed helper".to_string()
+    };
+    let decision = match Access::load(access_path) {
+        Ok(access) => authorize(&access, &peer, password.as_deref(), throttle).await,
+        Err(error) => Decision::Refuse(format!("{error:#}")),
+    };
+    let decision = match decision {
+        Decision::Ask if login => Decision::Refuse(
+            "Nobody has signed in on that computer, so nobody can approve you. Ask to be paired, or use its unattended password".into(),
+        ),
+        Decision::Ask => {
+            ask(
+                notices,
+                asking,
+                &connection,
+                access_path,
+                &name,
+                &peer,
+                Offered { tools, clipboard },
+            )
+            .await
+        }
+        other => other,
+    };
+    // At the sign in screen a command would run as the system, and whatever
+    // is copied there is most likely a password.
+    let tools = tools && !login;
+    let clipboard_read = clipboard && !login;
+    let (control, allowed_tools, allowed_clipboard) = match decision {
+        Decision::Grant(Granted {
+            control,
+            tools,
+            clipboard,
+        }) => (control, tools, clipboard),
+        Decision::Ask => unreachable!("answered above"),
+        Decision::Refuse(reason) => {
+            refuse(connection, send, reason.clone());
+            let _ = notices.send(Notice::Refused { name, peer, reason }).await;
+            return;
+        }
+    };
+    let Ok(seat) = seats.clone().try_acquire_owned() else {
+        let reason = format!(
+            "That computer already has {MAX_HELPERS} helpers connected. Try again when one leaves"
+        );
+        refuse(connection, send, reason.clone());
+        let _ = notices.send(Notice::Refused { name, peer, reason }).await;
+        return;
+    };
+    let (session, mut worker) = session::channels();
+    worker.tools_tx.send_replace(tools && allowed_tools);
+    worker
+        .clipboard_read
+        .send_replace(clipboard_read && allowed_clipboard);
+    let desktop = desktop.clone();
+    // The session ends when whoever holds it lets go, or when this
+    // listener stops: either cancels the same token.
+    let ended = session.cancel_token();
+    if notices
+        .send(Notice::Connected {
+            name: name.clone(),
+            peer: peer.clone(),
+            control,
+            session,
+        })
+        .await
+        .is_err()
+    {
+        // Nobody holds the listener any more, so it is stopping.
+        return;
+    }
+    // Each helper is served on its own, so a second one is answered while
+    // the first is still in, instead of finding the computer silent.
+    let stop = stop.clone();
+    let notices = notices.clone();
+    tokio::spawn(async move {
+        let _seat = seat;
+        let result = tokio::select! {
+            _ = stop.cancelled() => Ok(()),
+            _ = ended.cancelled() => Ok(()),
+            result = session::serve(&mut worker, &connection, send, recv, peer, session::Offer { control, tools, clipboard }, wire::Screens::from_hello(jpeg, tiles, &video), move || desktop()) => result,
+        };
+        // The app stopping, for an update or a restart, ends nothing the
+        // person decided, so the helper is told the link went and
+        // connects again once the computer is back. Quitting also drops
+        // whoever holds the session, so the session may have ended as
+        // closed a moment before this saw the stop: the stop still wins.
+        let result = if stop.is_cancelled() {
+            Err(session::link_lost(anyhow!(
+                "DeskVNC Support on that computer stopped"
+            )))
+        } else {
+            result
+        };
+        session::close_served(&connection, &result);
+        // Whoever holds the session hears that it ended, so a banner
+        // saying the helper is in does not outlive the helper.
+        let reason = result.as_ref().err().map(|error| format!("{error:#}"));
+        let _ = worker
+            .emit(Event::Finished(match &reason {
+                Some(reason) => Err(anyhow!("{reason}")),
+                None => Ok(()),
+            }))
+            .await;
+        if let Some(reason) = reason {
+            let _ = notices
+                .send(Notice::Status(format!("{name}'s session ended: {reason}")))
+                .await;
+        }
+    });
 }
 
 /// How many helpers may be connected unattended at once.
@@ -496,27 +612,53 @@ fn refuse(
 /// What happens to a helper that knocks.
 #[derive(Debug, PartialEq, Eq)]
 enum Decision {
-    /// In, with control or not, and with its tools allowed or not.
-    Grant(bool, bool),
+    /// In, with what it may do.
+    Grant(Granted),
     /// Not paired and no password: the person at the computer decides.
     Ask,
     Refuse(String),
 }
 
+/// What a helper let in may do.
+#[derive(Debug, PartialEq, Eq)]
+struct Granted {
+    control: bool,
+    /// Its tools may run commands and copy files.
+    tools: bool,
+    /// It sees what the person copies.
+    clipboard: bool,
+}
+/// What a helper said it can do beyond the screen, which the person is asked
+/// about.
+struct Offered {
+    tools: bool,
+    clipboard: bool,
+}
+
 /// Ask the person at the computer about a helper, and pair it if they say so.
+///
+/// The question is withdrawn if the helper leaves first: dropping the
+/// reply closes the answer, which is how the window knows to take it down.
 async fn ask(
     notices: &mpsc::Sender<Notice>,
+    asking: &tokio::sync::Mutex<()>,
+    connection: &iroh::endpoint::Connection,
     access_path: &Path,
     name: &str,
     peer: &str,
-    tools: bool,
+    offered: Offered,
 ) -> Decision {
+    let Offered { tools, clipboard } = offered;
+    let Ok(_asking) = asking.try_lock() else {
+        return Decision::Refuse("The person at that computer is already answering another helper. Try again in a minute".into());
+    };
     let (answer, reply) = tokio::sync::oneshot::channel();
     if notices
         .send(Notice::Ask {
             name: name.to_string(),
             peer: peer.to_string(),
             tools,
+            clipboard,
             answer,
         })
         .await
@@ -524,7 +666,11 @@ async fn ask(
     {
         return Decision::Refuse("Nobody is at that computer to approve you".into());
     }
-    let asked = match tokio::time::timeout(ASK_TIMEOUT, reply).await {
+    let answered = tokio::select! {
+        _ = connection.closed() => return Decision::Refuse("The helper left before anyone answered".into()),
+        answered = tokio::time::timeout(ASK_TIMEOUT, reply) => answered,
+    };
+    let asked = match answered {
         Ok(Ok(asked)) => asked,
         Ok(Err(_)) => return Decision::Refuse("The person at that computer did not answer".into()),
         Err(_) => return Decision::Refuse("Nobody answered at that computer within a minute. Ask the person there to approve you, or to pair you".into()),
@@ -537,12 +683,14 @@ async fn ask(
         Approval::Control => true,
     };
     let tools = tools && asked.tools;
+    let clipboard = clipboard && asked.clipboard;
     if asked.pair {
         // A failed save still lets this session in; it only means the next
         // one asks again.
         let saved = Access::load(access_path).and_then(|mut access| {
             access.trust(peer, name, control)?;
             access.allow_tools(peer, tools);
+            access.allow_clipboard(peer, clipboard);
             access.save(access_path)
         });
         if let Err(error) = saved {
@@ -551,7 +699,11 @@ async fn ask(
                 .await;
         }
     }
-    Decision::Grant(control, tools)
+    Decision::Grant(Granted {
+        control,
+        tools,
+        clipboard,
+    })
 }
 
 /// Let a helper in, and with what, or say why not: whether it may control,
@@ -562,17 +714,24 @@ async fn authorize(
     access: &Access,
     peer: &str,
     password: Option<&str>,
-    throttle: &mut Throttle,
+    throttle: &tokio::sync::Mutex<Throttle>,
 ) -> Decision {
     use Decision::{Ask, Grant, Refuse};
     if !access.enabled {
         return Refuse("Unattended access is switched off on that computer".into());
     }
     if let Some(helper) = access.helper(peer) {
-        return Grant(helper.control, helper.tools);
+        return Grant(Granted {
+            control: helper.control,
+            tools: helper.tools,
+            clipboard: helper.clipboard,
+        });
     }
     match password {
         Some(password) if access.has_password() => {
+            // One password at a time, as when knocks were read one by one:
+            // a burst of guesses all counts before the next is tried.
+            let mut throttle = throttle.lock().await;
             if throttle.locked() {
                 return Refuse(
                     "Too many wrong passwords. Password access to that computer is paused for 15 minutes"
@@ -586,7 +745,11 @@ async fn authorize(
                 .await
                 .unwrap_or(false);
             if matches {
-                Grant(true, false)
+                Grant(Granted {
+                    control: true,
+                    tools: false,
+                    clipboard: false,
+                })
             } else {
                 throttle.failed();
                 // A wrong guess costs the guesser time as well as an attempt.
@@ -663,6 +826,7 @@ pub fn connect_with_tools(
         Abilities {
             tools: true,
             video: false,
+            clipboard: false,
         },
     )
 }
@@ -740,6 +904,7 @@ pub fn connect_to_with_tools(
         Abilities {
             tools: true,
             video: false,
+            clipboard: false,
         },
     )
 }
@@ -793,13 +958,40 @@ async fn run_connect(
         .await?;
     let target = target.resolve().await?;
     let endpoint = crate::shared::helper(&options, key).await?;
+    let result = visit(worker, &endpoint, target, name, password, abilities).await;
+    // A lost link is dialled again in a moment. Binding a new endpoint for
+    // that and finding the relay again cost 1 to 3 seconds of the 4 to 7 it
+    // took to get back to a restarted computer, so this one is kept a while.
+    if result.as_ref().is_err_and(session::LinkLost::is) {
+        let kept = endpoint.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(KEEP_ENDPOINT).await;
+            drop(kept);
+        });
+    }
+    result
+}
+/// How long a helper's endpoint outlives a session whose link was lost.
+const KEEP_ENDPOINT: Duration = Duration::from_secs(30);
+async fn visit(
+    worker: &mut session::Worker,
+    endpoint: &iroh::Endpoint,
+    target: EndpointAddr,
+    name: String,
+    password: Option<String>,
+    abilities: Abilities,
+) -> Result<()> {
     let connection = tokio::time::timeout(Duration::from_secs(30), endpoint.connect(target, wire::ALPN))
         .await
         .context("The computer did not answer. It may be off, asleep, offline, or its unattended access may be switched off")
         .map_err(session::link_lost)?
         .context("Cannot reach the computer")
         .map_err(session::link_lost)?;
-    let (mut send, recv) = connection.open_bi().await?;
+    // Nothing has been asked yet, so failing here is the link failing.
+    let (mut send, recv) = connection
+        .open_bi()
+        .await
+        .map_err(|e| session::link_lost(e.into()))?;
     wire::write(
         &mut send,
         &Message::Knock {
@@ -810,19 +1002,33 @@ async fn run_connect(
             jpeg: true,
             tiles: true,
             video: abilities.codecs(),
+            clipboard: abilities.clipboard,
         },
     )
-    .await?;
-    let result = session::watch_session(worker, &connection, send, recv).await;
+    .await
+    .map_err(session::link_lost)?;
+    let result =
+        session::watch_session(worker, &connection, send, recv, session::UNATTENDED_WAIT).await;
     connection.close(0u8.into(), b"Session ended");
     result
 }
 
-struct Closing(iroh::Endpoint);
+struct Closing(iroh::Endpoint, Arc<tokio::sync::Semaphore>);
 impl Drop for Closing {
     fn drop(&mut self) {
         let endpoint = self.0.clone();
-        tokio::spawn(async move { endpoint.close().await });
+        let seats = self.1.clone();
+        tokio::spawn(async move {
+            // Closing the endpoint closes every connection as a plain end,
+            // which would beat the sessions telling their helpers the
+            // computer went away. Wait for them, but not forever.
+            let _ = tokio::time::timeout(
+                Duration::from_secs(2),
+                seats.acquire_many(MAX_HELPERS as u32),
+            )
+            .await;
+            endpoint.close().await
+        });
     }
 }
 
@@ -873,4 +1079,47 @@ pub fn validate_machine_id(text: &str) -> Result<()> {
         bail!("That is not a machine ID");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn helpers_saved_before_clipboard_never_read_it() {
+        let saved = br#"{"enabled":true,"helpers":[{"id":"x","name":"Friend","control":true,"tools":true,"added":1}]}"#;
+        let access: Access = serde_json::from_slice(saved).unwrap();
+        assert!(!access.helpers[0].clipboard);
+        let mut access = access;
+        assert!(access.allow_clipboard("x", true));
+        assert!(access.helpers[0].clipboard);
+        assert!(!access.allow_clipboard("nobody", true));
+        let back: Access = serde_json::from_slice(&serde_json::to_vec(&access).unwrap()).unwrap();
+        assert!(back.helpers[0].clipboard);
+    }
+
+    #[tokio::test]
+    async fn a_password_never_lets_a_helper_read() {
+        let mut access = Access {
+            enabled: true,
+            ..Access::default()
+        };
+        access.set_password(Some("correct horse battery")).unwrap();
+        let throttle = tokio::sync::Mutex::new(Throttle::default());
+        let decision = authorize(
+            &access,
+            "stranger",
+            Some("correct horse battery"),
+            &throttle,
+        )
+        .await;
+        assert_eq!(
+            decision,
+            Decision::Grant(Granted {
+                control: true,
+                tools: false,
+                clipboard: false,
+            })
+        );
+    }
 }
