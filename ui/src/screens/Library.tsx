@@ -10,8 +10,10 @@ import {
 } from "react";
 import { useHosts } from "../state/HostsContext";
 import { useDiscovery } from "../state/DiscoveryContext";
+import { ScanButton } from "../components/ScanButton";
 import { useSettings, MAX_QUICK_CONNECT_HISTORY, type SortKey } from "../state/SettingsContext";
 import { useToasts } from "../state/ToastContext";
+import { saveCredentials } from "../lib/credentialStore";
 import type { DiscoveredHost, HostGroup, HostProfile, ProtocolKind } from "../lib/types";
 import { serializeRdpSettings } from "../lib/rdp";
 import { discoveredEndpoint } from "../lib/address";
@@ -27,18 +29,18 @@ import {
 } from "../lib/types";
 import {
   allowsMultipleSessions,
+  importRdpFile,
+  importRdpFiles,
   inTauri,
+  pickRdpFiles,
+  takePendingRdpFiles,
+  RDP_OPEN_EVENT,
   openSessionWindow,
   safeInvoke,
   safeListen,
   forgetCertificate,
-  importRdpFiles,
-  pickRdpFiles,
-  takePendingRdpFiles,
-  RDP_OPEN_EVENT,
   type OpenSessionOptions,
 } from "../lib/tauri";
-import { findExistingHost, importedName, splitRdpUser } from "../lib/rdpImport";
 import { seedMockThumbnails, useMockData } from "../lib/mock";
 import { useSessions } from "../state/SessionsContext";
 import { useTabs } from "../state/TabsContext";
@@ -56,6 +58,7 @@ import { HostTile, DiscoveredTile, addressLabel, osLabel } from "../components/H
 import { CommandPalette, type PaletteAction } from "../components/CommandPalette";
 import { HostDialog, draftFromHost, type HostDraft } from "../components/HostDialog";
 import { loadRdpDefaults } from "../lib/rdpDefaults";
+import { draftFromRdpImport, findExistingHost, importedName } from "../lib/rdpImport";
 import { QuickConnect } from "../components/QuickConnect";
 import { ContextMenu, Dialog, EmptyState, Select, TileSkeleton, type MenuItem } from "../components/primitives";
 import {
@@ -73,6 +76,7 @@ import {
 import { emit, listen } from "@tauri-apps/api/event";
 import {
   AGENT_OPEN_EVENT,
+  agentOpenOptions,
   type AgentOpenRequest,
   EDIT_HOST_EVENT,
   type EditHostRequest,
@@ -126,7 +130,7 @@ export function Library({
   onAutoAddHandled?: () => void;
 }): ReactNode {
   const { hosts, groups, tags, loading, saveHost, deleteHost, saveGroup, saveTag, setHostTags, setHostsGroup, addTagToHosts, removeTagFromHosts, savePassword, saveSshPassphrase, saveRdpCredentials, wakeHost, refresh, refreshThumbnail } = useHosts();
-  const { discovered, scan, startScan } = useDiscovery();
+  const { discovered, scan, startScan, stopScan, listNetworks } = useDiscovery();
   const { settings, update } = useSettings();
   const { livePreviews, setLivePreviews } = useSessions();
   const {
@@ -788,11 +792,7 @@ export function Library({
       const ask = e.payload;
       if (!ask) return;
       const host = ask.hostId ? hostsRef.current.find((h) => h.id === ask.hostId) : undefined;
-      const background = ask.background === true;
-      const options: OpenSessionOptions = host
-        ? { profileId: host.id, background }
-        : { address: ask.address, port: ask.port, protocol: ask.protocol, background };
-      void openSession(options, host?.friendlyName || ask.address);
+      void openSession(agentOpenOptions(ask), host?.friendlyName || ask.address);
     }).then((un) => {
       stop = un;
     });
@@ -802,24 +802,26 @@ export function Library({
   // ------------------------------------------------------------ .rdp files
 
   /**
-   * Import `.rdp` files into the library, and optionally connect to them.
+   * Save several `.rdp` files at once, and optionally connect to them.
    *
-   * Each file becomes a saved RDP host, or, when a host with the same name,
-   * address and port is already saved, refreshes that host's stored user name
-   * and leaves its settings alone (`findExistingHost`). The file's password
-   * blob is never read (`vnc_store::parse_rdp_file`), so a password is still
-   * only stored after a server accepted it.
+   * Each file becomes a new RDP host with the file's own settings
+   * (`draftFromRdpImport`), or, when an RDP host with the same name, address
+   * and port is already saved, only refreshes that host's stored account and
+   * leaves its settings alone (`findExistingHost`). That is what keeps a
+   * gateway that hands out a one-time file per session (Fudo PAM) on one
+   * library entry. The file's password line is never read, as with a single
+   * import.
    *
    * `connect` is for files the app was asked to OPEN (a double-click, "Open
-   * with"); a bulk import from the button or the File menu only saves.
+   * with"); a bulk import from the picker only saves.
    */
-  const importRdp = useCallback(
+  const saveRdpFiles = useCallback(
     async (paths: string[], connect: boolean): Promise<void> => {
       if (paths.length === 0) return;
       let rows;
       try {
         rows = await importRdpFiles(paths);
-      } catch (err) {
+      } catch (err: unknown) {
         push("danger", `Could not import: ${String(err)}`);
         return;
       }
@@ -828,31 +830,42 @@ export function Library({
       let updated = 0;
       let warnings = 0;
       for (const row of rows) {
-        const draft = row.import;
-        if (!draft) {
+        if (!row.import) {
           failed.push(row.error ?? row.path);
           continue;
         }
-        warnings += draft.warnings.length;
-        const name = importedName(draft.profile.friendlyName);
+        warnings += row.import.warnings.length;
+        const draft = draftFromRdpImport(row.import);
+        const name = importedName(draft.friendlyName);
         // Hosts saved earlier in this batch count too: the library's list only
-        // catches up on the next render, and two copies of one gateway file
-        // in a single selection must still become one host.
-        const existing = findExistingHost([...saved, ...hostsRef.current], draft.profile, name);
+        // catches up on the next render, and two copies of one gateway file in
+        // a single selection must still become one host.
+        const existing = findExistingHost([...saved, ...hostsRef.current], row.import.profile, name);
         let host: HostProfile | null = existing ?? null;
         if (existing) {
           if (!saved.some((h) => h.id === existing.id)) updated += 1;
         } else {
-          const { id: _draftId, ...profile } = draft.profile;
-          host = await saveHost({ ...profile, friendlyName: name, groupId: null, tags: [] });
+          const { id: _fromShell, ...profile } = row.import.profile;
+          host = await saveHost({
+            ...profile,
+            friendlyName: name,
+            groupId: null,
+            tags: [],
+            qualityPref: draft.qualityPref,
+            scalingMode: draft.scalingMode,
+            rdpSettings: serializeRdpSettings(draft.rdp),
+          });
         }
         if (!host) {
           failed.push(`${name}: could not be saved`);
           continue;
         }
         const target: HostProfile = host;
-        const { user, domain } = splitRdpUser(draft.username);
-        await saveRdpCredentials(target.id, { user, domain, password: "" });
+        await saveRdpCredentials(target.id, {
+          user: draft.rdpUser,
+          domain: draft.rdpDomain,
+          password: "",
+        });
         if (!saved.some((h) => h.id === target.id)) saved.push(target);
       }
 
@@ -879,10 +892,25 @@ export function Library({
     [saveHost, saveRdpCredentials, push, selectTab, connectHost],
   );
 
-  const importRdpFromPicker = useCallback(async (): Promise<void> => {
+  /**
+   * Import `.rdp` files picked by the person. One file opens the editor on
+   * the draft, with whatever did not come across written above the form, and
+   * nothing is saved until they press Save. Several are saved in one go by
+   * `saveRdpFiles`.
+   */
+  const importRdp = useCallback(async (): Promise<void> => {
     const paths = await pickRdpFiles();
-    await importRdp(paths, false);
-  }, [importRdp]);
+    if (paths.length === 0) return;
+    if (paths.length > 1) {
+      await saveRdpFiles(paths, false);
+      return;
+    }
+    try {
+      setHostDialog(draftFromRdpImport(await importRdpFile(paths[0])));
+    } catch (err: unknown) {
+      push("danger", `Could not import that Remote Desktop file: ${String(err)}`);
+    }
+  }, [push, saveRdpFiles]);
 
   // Files the app was asked to open: whatever was queued before this mounted
   // (the launch's own command line), then anything a later double-click
@@ -893,7 +921,7 @@ export function Library({
     let unlisten: (() => void) | undefined;
     const drain = async (): Promise<void> => {
       const paths = await takePendingRdpFiles();
-      if (!cancelled && paths.length > 0) await importRdp(paths, true);
+      if (!cancelled && paths.length > 0) await saveRdpFiles(paths, true);
     };
     void safeListen<null>(RDP_OPEN_EVENT, () => void drain()).then((fn) => {
       if (cancelled) fn();
@@ -904,7 +932,7 @@ export function Library({
       cancelled = true;
       unlisten?.();
     };
-  }, [importRdp]);
+  }, [saveRdpFiles]);
 
   const saveDraft = useCallback(
     async (draft: HostDraft): Promise<void> => {
@@ -932,7 +960,11 @@ export function Library({
         sshSettings: draft.protocol === "ssh" ? serializeSshSettings(draft.ssh) : null,
       });
       const id = saved?.id ?? draft.id;
+      let credentialError: unknown = null;
       if (id) {
+        // The host is saved by now. A password that could not be stored is
+        // said out loud: it used to vanish and come back as a prompt.
+        try {
         // An RDP password belongs with its user name and domain, which are
         // three fields of one credential rather than a password on its own.
         if (draft.protocol === "rdp") {
@@ -940,6 +972,7 @@ export function Library({
             user: draft.rdpUser,
             domain: draft.rdpDomain,
             password: draft.password,
+            gatewayPassword: draft.rdgPassword,
           });
         } else if (draft.protocol === "ssh") {
           // `save_password` (Rust) already carries `sshUser` / `sshPassword`
@@ -959,7 +992,7 @@ export function Library({
           if (draft.sshUser.trim()) payload.sshUser = draft.sshUser.trim();
           if (draft.password) payload.sshPassword = draft.password;
           if (Object.keys(payload).length > 0) {
-            await safeInvoke("save_password", { hostId: id, creds: payload }, null);
+            await saveCredentials(id, payload);
             // `saveRdpCredentials` flips `hasPassword` in local state itself
             // after a write like this one, which needs `setHosts` and so
             // lives in HostsContext.tsx, outside this change's scope. A
@@ -981,7 +1014,7 @@ export function Library({
           if (payload?.vncPassword && !payload.vencryptUser && !payload.vencryptPass) {
             await savePassword(id, payload.vncPassword);
           } else if (payload) {
-            await safeInvoke("save_password", { hostId: id, creds: payload }, null);
+            await saveCredentials(id, payload);
             // Same reason as the SSH branch: the key icon is re-read rather
             // than flipped here.
             if (payload.vencryptPass) await refresh();
@@ -990,10 +1023,20 @@ export function Library({
           await savePassword(id, draft.password);
         }
         if (draft.sshPassphrase) await saveSshPassphrase(id, draft.sshPassphrase);
+        } catch (err) {
+          credentialError = err;
+        }
         await setHostTags(id, draft.tagIds);
       }
       setHostDialog(null);
-      push("success", draft.id ? "Host updated" : `Added ${draft.friendlyName}`);
+      if (credentialError) {
+        push(
+          "danger",
+          `${draft.id ? "Host updated" : `Added ${draft.friendlyName}`}, but its password was not saved: ${String(credentialError)}`,
+        );
+      } else {
+        push("success", draft.id ? "Host updated" : `Added ${draft.friendlyName}`);
+      }
     },
     [saveHost, savePassword, saveSshPassphrase, saveRdpCredentials, setHostTags, refresh, push],
   );
@@ -1010,8 +1053,11 @@ export function Library({
         run: () => selectTab(t.id),
       })),
       { id: "new-host", label: "New host…", hint: "", run: () => setHostDialog(draftFromHost(null)) },
+      { id: "import-rdp", label: "Import Remote Desktop files…", hint: "", run: () => void importRdp() },
       { id: "quick-connect", label: "Connect to an address…", hint: `${modKeyLabel}T`, run: focusQuickConnect },
-      { id: "scan", label: "Scan network", hint: "", run: () => void startScan() },
+      scan.running
+        ? { id: "stop-scan", label: "Stop scan", hint: "", run: () => void stopScan() }
+        : { id: "scan", label: "Scan network", hint: "", run: () => void startScan() },
       {
         id: "toggle-view",
         label: settings.libraryView === "grid" ? "Switch to list view" : "Switch to grid view",
@@ -1022,7 +1068,7 @@ export function Library({
       { id: "help", label: "Help & keyboard shortcuts", run: onOpenAbout },
       { id: "about", label: "About DeskVNCViewer", run: onOpenAbout },
     ];
-  }, [summaries, selectTab, settings.libraryView, update, startScan, focusQuickConnect, onOpenPreferences, onOpenAbout, refresh]);
+  }, [summaries, selectTab, settings.libraryView, update, scan.running, startScan, stopScan, focusQuickConnect, onOpenPreferences, onOpenAbout, refresh, importRdp]);
 
   // Onboarding hand-off: open the add dialog pre-filled from a discovered host
   useEffect(() => {
@@ -1092,24 +1138,20 @@ export function Library({
   useEffect(() => {
     let unlisten: (() => void) | undefined;
     void safeListen<{ id: string }>("menu://action", ({ id }) => {
-      if (id === "menu:import-rdp") {
-        selectTab(null);
-        void importRdpFromPicker();
-        return;
-      }
-      if (id !== "menu:quick-connect" && id !== "menu:new-host") return;
+      if (id !== "menu:quick-connect" && id !== "menu:new-host" && id !== "menu:import-rdp") return;
       selectTab(null);
       // Focus cannot land on an element that is still hidden, so let the pane
       // swap paint first.
       requestAnimationFrame(() => {
         if (id === "menu:quick-connect") focusQuickConnect();
+        else if (id === "menu:import-rdp") void importRdp();
         else setHostDialog(draftFromHost(null));
       });
     }).then((fn) => {
       unlisten = fn;
     });
     return () => unlisten?.();
-  }, [focusQuickConnect, selectTab, importRdpFromPicker]);
+  }, [focusQuickConnect, selectTab, importRdp]);
 
   // ------------------------------------------------------------ context menu
 
@@ -1345,28 +1387,24 @@ export function Library({
         >
           <IconActivity size={15} />
         </button>
-        <button type="button" className="btn-secondary relative overflow-hidden" onClick={() => void startScan()}>
-          {scan.running ? (
-            <span className="absolute inset-x-0 bottom-0 h-0.5 bg-inset">
-              <span
-                className={classNames("block h-full bg-accent", scan.total === 0 && "indeterminate-bar w-1/3")}
-                style={scan.total > 0 ? { width: `${(scan.done / scan.total) * 100}%` } : undefined}
-              />
-            </span>
-          ) : null}
-          <IconZap size={14} />
-          {scan.running ? "Scanning…" : "Scan network"}
+        <ScanButton
+          scan={scan}
+          onStop={() => void stopScan()}
+          listNetworks={listNetworks}
+          onScan={(target) =>
+            startScan(target).catch((err: unknown) => {
+              push("danger", `Could not scan: ${err instanceof Error ? err.message : String(err)}`);
+            })
+          }
+        />
+        <button
+          type="button"
+          className="btn-secondary"
+          title="Import one or more Remote Desktop (.rdp) files"
+          onClick={() => void importRdp()}
+        >
+          Import .rdp
         </button>
-        {inTauri() ? (
-          <button
-            type="button"
-            className="btn-secondary"
-            title="Import one or more Microsoft Remote Desktop (.rdp) files"
-            onClick={() => void importRdpFromPicker()}
-          >
-            Import .rdp
-          </button>
-        ) : null}
         <button type="button" className="btn-primary" onClick={() => setHostDialog(draftFromHost(null))}>
           <IconPlus size={14} /> New Host
         </button>

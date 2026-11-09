@@ -23,8 +23,8 @@
 
 use crate::error::{codes, ToolError};
 use crate::plane::{
-    FileEntry, FileOp, FileOutcome, HostRecord, InputRefused, LeaseAsk, OpenRequest, SessionSource,
-    TypingRefused,
+    FileEntry, FileOp, FileOutcome, HostRecord, InputRefused, LeaseAsk, LiveSession, Nudge,
+    OpenRequest, RemoteClip, SessionClosed, SessionSource, TypingRefused,
 };
 use agent_plane::{Attach, Damage, Frame, FrameSource, LimbRegistry, PerceptionUnavailable};
 use limb_core::capability::Capability;
@@ -130,6 +130,9 @@ impl Recorder {
 pub struct FakeFrames {
     size: (u16, u16),
     pending: Mutex<Vec<Rect>>,
+    /// Until when a read refuses as priming, the way a mirror waiting for a
+    /// full refresh over a slow link does.
+    priming_until: Mutex<Option<std::time::Instant>>,
 }
 
 impl FakeFrames {
@@ -138,7 +141,14 @@ impl FakeFrames {
         FakeFrames {
             size,
             pending: Mutex::new(Vec::new()),
+            priming_until: Mutex::new(None),
         }
+    }
+
+    /// Refuse reads as priming for this long, as a mirror does while a full
+    /// refresh of a large screen is still on its way.
+    pub fn priming_for(&self, how_long: std::time::Duration) {
+        *lock(&self.priming_until) = Some(std::time::Instant::now() + how_long);
     }
 
     /// Tell the mirror something changed. The next [`FrameSource::damage`] call
@@ -156,6 +166,11 @@ impl FrameSource for FakeFrames {
         _scale: Option<f32>,
         _at: Timestamp,
     ) -> Result<Frame, PerceptionUnavailable> {
+        if lock(&self.priming_until).is_some_and(|until| std::time::Instant::now() < until) {
+            return Err(PerceptionUnavailable(
+                "the mirror is priming: a full refresh is on its way".to_string(),
+            ));
+        }
         let covers = region.unwrap_or(Rect::new(0, 0, self.size.0, self.size.1));
         // A description rather than pixels. Nothing in this build decodes a
         // framebuffer, and returning bytes that look like an image would be a
@@ -195,6 +210,9 @@ pub struct FakeLimb {
     kind: ProtocolKind,
     grounding: Grounding,
     max_slots: Option<u16>,
+    /// Set while the person at the far side lets the helper only watch, as
+    /// a Boundary computer can. See [`FakeSource::watch_only`].
+    watching: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl FakeLimb {
@@ -204,6 +222,7 @@ impl FakeLimb {
             kind: ProtocolKind::Vnc,
             grounding: Grounding::Pixels,
             max_slots: Some(4),
+            watching: Arc::default(),
         }
     }
 
@@ -213,6 +232,7 @@ impl FakeLimb {
             kind: ProtocolKind::Ssh,
             grounding: Grounding::Cells,
             max_slots: None,
+            watching: Arc::default(),
         }
     }
 }
@@ -287,7 +307,11 @@ impl Limb for FakeLimb {
 
     fn supports(&self, intent: IntentName) -> Support {
         use IntentName::*;
+        let watching = self.watching.load(std::sync::atomic::Ordering::Relaxed);
         match intent {
+            Type | Press | Move | Click | Drag | Scroll if watching => Support::Unsupported {
+                because: "the person at that computer lets this helper watch only",
+            },
             Type | Press | Tune | ClipboardGet | ClipboardSet | SendBytes => Support::Lowered,
             Move | Click | Drag | Scroll => match self.grounding {
                 Grounding::Pixels => Support::Lowered,
@@ -398,6 +422,14 @@ pub struct FakeSource {
     channels: Mutex<BTreeMap<String, mpsc::Sender<ClientCommand>>>,
     mirrors: Mutex<BTreeMap<String, Arc<FakeFrames>>>,
     states: Mutex<BTreeMap<String, SessionState>>,
+    /// Sessions "the application" has open, by limb id, whether or not this
+    /// plane attached them: what `live` lists and `close` ends. Empty until a
+    /// test opens one with [`FakeSource::open_in_app`] or the plane opens one.
+    live: Mutex<BTreeMap<String, FakeHost>>,
+    /// Every session `close` ended, in order.
+    closed: Mutex<Vec<String>>,
+    /// What each machine last copied, as the application would hold it.
+    clipboards: Mutex<BTreeMap<String, RemoteClip>>,
     /// The SFTP sidecar every fake machine shares: a map from an absolute
     /// path to the bytes at it.
     ///
@@ -429,6 +461,17 @@ pub struct FakeSource {
     /// attachment id on it. `None` is an application that keeps none, which
     /// is what every fake was before the lease moved into the viewer.
     shared: Option<(Arc<Mutex<agent_lease::Board>>, String)>,
+    /// Refuse a mirror for any desktop larger than this many pixels, the way
+    /// the application's mirror budget does. `None` admits every size.
+    mirror_budget: Mutex<Option<u64>>,
+    /// Every repaint or reconnect asked of a limb, by limb id, in order.
+    nudges: Mutex<Vec<(String, Nudge)>>,
+    /// Each attached limb's watch only switch, by limb id.
+    watching: Mutex<BTreeMap<String, Arc<std::sync::atomic::AtomicBool>>>,
+    /// Sessions somebody opened by address and never saved, by limb id, with
+    /// the session id the application lists them under. See
+    /// [`FakeSource::open_unsaved_in_app`].
+    unsaved: Mutex<BTreeMap<String, String>>,
 }
 
 /// A far side that takes `allowed` more key presses and refuses the rest.
@@ -448,10 +491,17 @@ impl FakeSource {
             channels: Mutex::new(BTreeMap::new()),
             mirrors: Mutex::new(BTreeMap::new()),
             states: Mutex::new(BTreeMap::new()),
+            live: Mutex::new(BTreeMap::new()),
+            closed: Mutex::new(Vec::new()),
+            clipboards: Mutex::new(BTreeMap::new()),
             disk: Mutex::new(BTreeMap::new()),
             typing_refusals: Mutex::new(BTreeMap::new()),
             press_refusals: Mutex::new(BTreeMap::new()),
             shared: None,
+            nudges: Mutex::new(Vec::new()),
+            mirror_budget: Mutex::new(None),
+            watching: Mutex::new(BTreeMap::new()),
+            unsaved: Mutex::new(BTreeMap::new()),
         }
     }
 
@@ -472,6 +522,80 @@ impl FakeSource {
             FakeHost::desktop("h_lab01", "10.0.0.5"),
             FakeHost::terminal("h_lab02", "10.0.0.6"),
         ])
+    }
+
+    /// Refuse a mirror for a desktop over `pixels`, with the code and the
+    /// kind of sentence the application's budget refuses with.
+    pub fn refuse_mirrors_over(&self, pixels: u64) {
+        *lock(&self.mirror_budget) = Some(pixels);
+    }
+
+    /// Every repaint or reconnect asked so far, by limb id.
+    pub fn nudges(&self) -> Vec<(String, Nudge)> {
+        lock(&self.nudges).clone()
+    }
+
+    /// A saved machine opened in "the application" by somebody else, so it is
+    /// live and not attached by this plane. Returns the limb id `dvv_limbs`
+    /// would list it under.
+    pub fn open_in_app(&self, host_id: &str) -> String {
+        let host = self
+            .hosts
+            .iter()
+            .find(|h| h.host_id == host_id)
+            .expect("a machine this source publishes")
+            .clone();
+        let id = LimbRegistry::resolve(host.protocol, &MachineKey::profile(host_id), Slot(0));
+        lock(&self.states).insert(id.to_string(), SessionState::Connected);
+        lock(&self.live).insert(id.to_string(), host);
+        id.to_string()
+    }
+
+    /// A machine somebody opened by address and never saved, as a person
+    /// joins a Boundary support session by its invitation. The application
+    /// lists it among the hosts as discovered, under its own session id and
+    /// labelled with the address, and among the limbs with no saved machine
+    /// behind it. Returns the limb id `dvv_limbs` would list it under.
+    pub fn open_unsaved_in_app(
+        &self,
+        address: &str,
+        protocol: ProtocolKind,
+        session_id: &str,
+    ) -> String {
+        let port = protocol.default_port();
+        let machine = MachineKey::endpoint(protocol, address, port);
+        let id = LimbRegistry::resolve(protocol, &machine, Slot(0));
+        let host = FakeHost {
+            host_id: address.to_string(),
+            address: address.to_string(),
+            port,
+            protocol,
+            size: (1280, 720),
+            mirror: true,
+        };
+        lock(&self.states).insert(id.to_string(), SessionState::Connected);
+        lock(&self.live).insert(id.to_string(), host);
+        lock(&self.unsaved).insert(id.to_string(), session_id.to_string());
+        id.to_string()
+    }
+
+    /// The machine behind this limb copied `text`, and the application got it.
+    pub fn copy_on_far_side(&self, limb: &str, text: &str) {
+        let mut clipboards = lock(&self.clipboards);
+        let seq = clipboards.get(limb).map_or(1, |clip| clip.seq + 1);
+        clipboards.insert(
+            limb.to_string(),
+            RemoteClip {
+                text: text.to_string(),
+                seq,
+                age_ms: Some(0),
+            },
+        );
+    }
+
+    /// Every session `close` ended, in order.
+    pub fn closed_sessions(&self) -> Vec<String> {
+        lock(&self.closed).clone()
     }
 
     /// What the plane put on this limb's wire.
@@ -514,6 +638,15 @@ impl FakeSource {
                 },
             },
         );
+    }
+
+    /// Make the person at this limb's far side let the helper only watch, or
+    /// give control back, the way a Boundary computer's person can at any
+    /// time. The limb then refuses every pointer and keyboard intent.
+    pub fn watch_only(&self, limb: &str, watching: bool) {
+        if let Some(switch) = lock(&self.watching).get(limb) {
+            switch.store(watching, std::sync::atomic::Ordering::Relaxed);
+        }
     }
 
     /// This limb's mirror, so a test can say that something changed.
@@ -568,7 +701,7 @@ impl FakeSource {
 
 impl SessionSource for FakeSource {
     fn hosts(&self) -> Result<Vec<HostRecord>, ToolError> {
-        Ok(self
+        let mut hosts: Vec<HostRecord> = self
             .hosts
             .iter()
             .map(|host| HostRecord {
@@ -583,7 +716,24 @@ impl SessionSource for FakeSource {
                 credential_stored: false,
                 discovered: false,
             })
-            .collect())
+            .collect();
+        // What is open and not saved, as the application lists it: under the
+        // session's id, labelled with its address.
+        let live = lock(&self.live);
+        for (limb, session) in lock(&self.unsaved).iter() {
+            if let Some(host) = live.get(limb) {
+                hosts.push(HostRecord {
+                    host_id: session.clone(),
+                    label: host.address.clone(),
+                    address: host.address.clone(),
+                    port: host.port,
+                    protocol: host.protocol.to_string(),
+                    credential_stored: false,
+                    discovered: true,
+                });
+            }
+        }
+        Ok(hosts)
     }
 
     fn open(&self, request: &OpenRequest) -> Result<Attach, ToolError> {
@@ -658,6 +808,21 @@ impl SessionSource for FakeSource {
             }
         };
 
+        if host.mirror && request.perceive {
+            let pixels = host.size.0 as u64 * host.size.1 as u64;
+            if let Some(budget) = *lock(&self.mirror_budget) {
+                if pixels > budget {
+                    return Err(ToolError::new(
+                        "BUDGET_REFUSED",
+                        format!(
+                            "a {}x{} mirror is {pixels} pixels and the per session budget is {budget}: nothing was allocated",
+                            host.size.0, host.size.1
+                        ),
+                    ));
+                }
+            }
+        }
+
         let frames: Option<Arc<dyn FrameSource>> = if host.mirror && request.perceive {
             let mut mirrors = lock(&self.mirrors);
             let mirror = mirrors
@@ -674,11 +839,22 @@ impl SessionSource for FakeSource {
         // spawned and an agent polls `dvv_status` or calls `dvv_wait` with
         // until connected.
         lock(&self.states).insert(id.to_string(), SessionState::Connected);
+        lock(&self.live).insert(id.to_string(), host.clone());
 
-        let driver: Arc<dyn Limb> = match host.protocol {
-            ProtocolKind::Ssh => Arc::new(FakeLimb::terminal()),
-            _ => Arc::new(FakeLimb::desktop()),
+        let mut limb = match host.protocol {
+            ProtocolKind::Ssh => FakeLimb::terminal(),
+            // Of the machine's own protocol, which the limb id is derived
+            // from, as the application's limbs are.
+            _ => FakeLimb {
+                kind: host.protocol,
+                ..FakeLimb::desktop()
+            },
         };
+        limb.watching = lock(&self.watching)
+            .entry(id.to_string())
+            .or_default()
+            .clone();
+        let driver: Arc<dyn Limb> = Arc::new(limb);
         Ok(Attach {
             driver,
             machine,
@@ -697,6 +873,47 @@ impl SessionSource for FakeSource {
 
     fn state(&self, limb: &LimbId) -> Option<SessionState> {
         lock(&self.states).get(limb.as_str()).cloned()
+    }
+
+    fn nudge(&self, limb: &LimbId, nudge: Nudge) -> Result<(), ToolError> {
+        lock(&self.nudges).push((limb.to_string(), nudge));
+        Ok(())
+    }
+
+    fn remote_clipboard(&self, limb: &LimbId) -> Result<Option<RemoteClip>, ToolError> {
+        Ok(lock(&self.clipboards).get(limb.as_str()).cloned())
+    }
+
+    fn live(&self) -> Vec<LiveSession> {
+        let unsaved = lock(&self.unsaved);
+        lock(&self.live)
+            .iter()
+            .map(|(id, host)| LiveSession {
+                limb_id: id.clone(),
+                host: host.address.clone(),
+                host_id: (!unsaved.contains_key(id)).then(|| host.host_id.clone()),
+                port: host.port,
+                protocol: host.protocol.to_string(),
+                slot: 0,
+                state: serde_json::json!({ "state": "connected" }),
+                attached_elsewhere: false,
+            })
+            .collect()
+    }
+
+    /// Every session here is one "an agent opened", so a close ends it. The
+    /// person's own sessions are the application's rule to keep, and that
+    /// rule is tested where it lives, in the shell.
+    fn close(&self, limb: &LimbId) -> Result<Option<SessionClosed>, ToolError> {
+        if lock(&self.live).remove(limb.as_str()).is_none() {
+            return Ok(None);
+        }
+        lock(&self.states).remove(limb.as_str());
+        lock(&self.closed).push(limb.to_string());
+        Ok(Some(SessionClosed {
+            closed: true,
+            why: None,
+        }))
     }
 
     fn typing_fence(&self, limb: &LimbId) -> Option<TypingRefused> {

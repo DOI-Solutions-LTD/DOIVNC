@@ -39,7 +39,8 @@ import { emit } from "@tauri-apps/api/event";
 import { EDIT_HOST_EVENT } from "../lib/editHost";
 import { Dialog } from "../components/primitives";
 import { candidateSeams, detectVerticalSeam } from "../render/seams";
-import type { QualityPreset, ScalingMode, SessionState } from "../lib/types";
+import type { QualityPreset, ScalingMode, SessionState, SshTunnelSettings } from "../lib/types";
+import { parseSshTunnel, sideChannelLogin } from "../lib/types";
 import {
   buildDisplayOptions,
   displayLabel,
@@ -57,7 +58,7 @@ import {
   type ViewPrefs,
 } from "../lib/viewPrefs";
 import { syncSessionMenu, type SessionMenuState } from "../lib/menuSync";
-import { ClipboardEcho } from "../lib/clipboardEcho";
+import { ClipboardEcho, syncsOnArrival } from "../lib/clipboardEcho";
 import {
   PREF_CLIPBOARD_AUTO,
   PREF_CLIPBOARD_ON_PASTE,
@@ -329,6 +330,10 @@ function SessionView({
   // whose remote size is driven by the scaling mode). Changing it here lasts
   // for this session; the profile stays the answer for the next connect.
   const [resolution, setResolution] = useState<RdpResolution | null>(null);
+  // The profile's "Open full screen" (`screen mode id:i:2` in an imported
+  // `.rdp` file). Applied once, the first time the session connects; after
+  // that the window is the person's to put back.
+  const [openFullscreen, setOpenFullscreen] = useState(false);
   const resolutionRef = useRef<RdpResolution | null>(null);
   resolutionRef.current = resolution;
   const [zoom, setZoomState] = useState(stored.zoom);
@@ -454,6 +459,13 @@ function SessionView({
       return;
     }
     rendererRef.current = renderer;
+    // A Boundary computer answers a refresh with the whole screen as tiles,
+    // which covers the last pictures of a run that WebKitGTK's decoder keeps
+    // back until more video comes (see `VIDEO_TAIL_QUIET_MS`). VNC and RDP
+    // could answer with more video, so they are not asked.
+    if (params.protocol === "boundary") {
+      renderer.onVideoBehind = () => sessionRef.current.refreshScreen();
+    }
     // The pointer preference was read before this renderer existed; see the
     // effect that owns `showRemoteCursorRef`.
     renderer.setCursorVisible(showRemoteCursorRef.current);
@@ -897,9 +909,11 @@ function SessionView({
     void safeInvoke<{ rdpSettings?: string | null } | null>("get_host", { hostId: id }, null).then(
       (host) => {
         if (cancelled) return;
-        setResolution(parseRdpSettings(host?.rdpSettings ?? null)?.resolution ?? {
+        const settings = parseRdpSettings(host?.rdpSettings ?? null);
+        setResolution(settings?.resolution ?? {
           mode: "window-at-connect",
         });
+        setOpenFullscreen(settings?.fullscreen === true);
       },
     );
     return () => {
@@ -1128,10 +1142,16 @@ function SessionView({
   // Remote clipboard -> local (text only). The write is native: the webview's
   // own clipboard API is gesture-gated and this text arrives from the socket.
   useEffect(() => {
-    const text = session.remoteClipboard;
-    if (text === null) return;
+    const text = session.remoteClipboard?.text;
+    if (text === undefined) return;
     clipboardEcho.moved(text);
-    void writeClipboard(text);
+    // Text the local clipboard already holds is not written again. A write
+    // is a new copy as far as the system is concerned, so a Boundary host on
+    // this same machine (one clipboard for both) would see it, send it back,
+    // and the two would pass the same text to each other twice a second.
+    void readClipboard().then((current) => {
+      if (current !== text) void writeClipboard(text);
+    });
   }, [session.remoteClipboard, clipboardEcho]);
 
   /**
@@ -1143,6 +1163,11 @@ function SessionView({
    */
   const pushClipboard = useCallback(
     async (force: boolean): Promise<"sent" | "unchanged" | "unreadable"> => {
+      // A Boundary computer takes text only while it says so (while this
+      // helper has control). Sent before then it would be dropped there, yet
+      // remembered here as moved, and the first paste after control came
+      // would skip it as a repeat.
+      if (session.boundaryClipboardWrite === false) return "unchanged";
       const text = await readClipboard();
       if (text === null) return "unreadable";
       if (!clipboardEcho.shouldPush(text, force)) return "unchanged";
@@ -1182,6 +1207,14 @@ function SessionView({
   pushClipboardRef.current = pushClipboard;
 
   const clipboardReady = session.state.state === "connected";
+  // Never true on Boundary, whose helper's clipboard goes over only on a
+  // paste or the Send clipboard button: see `syncsOnArrival`.
+  const syncOnArrival = syncsOnArrival({
+    protocol: params.protocol,
+    connected: clipboardReady,
+    owns,
+    remoteTakesText: session.boundaryClipboardWrite !== false,
+  });
   // Declared ahead of the sync below so it runs first: a reconnect brings up
   // a fresh clipboard channel, and the text pushed before the drop has to be
   // offered on it again rather than skipped as a repeat.
@@ -1189,7 +1222,7 @@ function SessionView({
     if (clipboardReady) clipboardEcho.connected();
   }, [clipboardReady, clipboardEcho]);
   useEffect(() => {
-    if (!clipboardReady || !owns) return;
+    if (!syncOnArrival) return;
     const sync = (): void => {
       if (!readBoolPref(PREF_CLIPBOARD_AUTO, true)) return;
       if (!readBoolPref(PREF_CLIPBOARD_ON_FOCUS, true)) return;
@@ -1200,7 +1233,7 @@ function SessionView({
     sync();
     window.addEventListener("focus", sync);
     return () => window.removeEventListener("focus", sync);
-  }, [clipboardReady, owns]);
+  }, [syncOnArrival]);
 
   // Bell: brief visual pulse via toast
   useEffect(() => {
@@ -1371,19 +1404,44 @@ function SessionView({
   const filesRef = useRef(files);
   filesRef.current = files;
 
+  // The SSH identity saved on the profile (its tunnel settings), which the
+  // Files panel and the terminal sign in with. `undefined` while it loads.
+  const [tunnel, setTunnel] = useState<SshTunnelSettings | null | undefined>(
+    params.profileId ? undefined : null,
+  );
+  useEffect(() => {
+    const id = params.profileId;
+    if (!id || params.protocol === "ssh") {
+      setTunnel(null);
+      return;
+    }
+    let cancelled = false;
+    void safeInvoke<{ sshTunnel?: string | null } | null>("get_host", { hostId: id }, null).then(
+      (host) => {
+        if (!cancelled) setTunnel(parseSshTunnel(host?.sshTunnel ?? null));
+      },
+    );
+    return () => {
+      cancelled = true;
+    };
+  }, [params.profileId, params.protocol]);
+  const login = useMemo(
+    () => (tunnel === undefined ? null : sideChannelLogin(params.address ?? "", tunnel)),
+    [params.address, tunnel],
+  );
+
   // Capability probe (PRD/08 §2.1), quiet: a closed port is the normal case
   // for a Windows box without OpenSSH Server, not an error worth a toast.
   useEffect(() => {
-    if (!params.address || session.state.state !== "connected") return;
+    if (!login?.host || session.state.state !== "connected") return;
     let cancelled = false;
-    void filesProbe(params.address, 22).then((ok) => {
+    void filesProbe(login.host, login.port).then((ok) => {
       if (!cancelled) setSshAvailable(ok);
     });
     return () => {
       cancelled = true;
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [params.address, session.state.state]);
+  }, [login, session.state.state]);
 
   /** Where a drop lands: whatever the remote pane shows, else the remote home. */
   const dropDir = useCallback((): string => {
@@ -1396,18 +1454,19 @@ function SessionView({
   /** Open the sidecar on demand; safe to call repeatedly. */
   const ensureFilesConnected = useCallback((): void => {
     const api = filesRef.current;
-    if (!params.address) return;
+    if (!login?.host) return;
     if (api.conn.state !== "idle" && api.conn.state !== "error") return;
     void api.connect({
-      host: params.address,
-      port: 22,
+      host: login.host,
+      port: login.port,
       // Empty means "the same user as here"; Rust fills it in and loads any
       // stored passphrase from the keychain. Secrets never travel through JS.
-      username: "",
-      auth: "stored",
+      username: login.username,
+      auth: login.auth,
+      keyPath: login.keyPath,
       profileId: params.profileId,
     });
-  }, [params.address, params.profileId]);
+  }, [login, params.profileId]);
 
   useEffect(() => {
     if (filesOpen) ensureFilesConnected();
@@ -1424,14 +1483,15 @@ function SessionView({
    */
   const sshTerminalConfig = useMemo<SshConnectConfig>(
     () => ({
-      host: params.address ?? "",
-      port: 22,
-      username: "",
-      auth: "stored",
+      host: login?.host ?? params.address ?? "",
+      port: login?.port ?? 22,
+      username: login?.username ?? "",
+      auth: login?.auth ?? "stored",
+      keyPath: login?.keyPath ?? null,
       profileId: params.profileId,
       multiplexer: { kind: "tmux", sessionName: "deskvnc", fallbackToShell: true },
     }),
-    [params.address, params.profileId],
+    [login, params.address, params.profileId],
   );
 
   /**
@@ -1555,6 +1615,28 @@ function SessionView({
     else void document.documentElement.requestFullscreen();
   }, [params.sessionId]);
 
+  // A profile that opens full screen does so once, on the first connect. A
+  // reconnect leaves the window as the person last put it.
+  const openedFullscreen = useRef(false);
+  const connectedNow = session.state.state === "connected";
+  useEffect(() => {
+    if (!openFullscreen || !connectedNow || openedFullscreen.current) return;
+    openedFullscreen.current = true;
+    void (async () => {
+      if (inTauri()) {
+        try {
+          const { getCurrentWindow } = await import("@tauri-apps/api/window");
+          if (await getCurrentWindow().isFullscreen()) return;
+        } catch {
+          /* ask anyway */
+        }
+      } else if (document.fullscreenElement) {
+        return;
+      }
+      await toggleFullscreen();
+    })();
+  }, [openFullscreen, connectedNow, toggleFullscreen]);
+
   /**
    * Native menu items that act on the session.
    *
@@ -1672,13 +1754,20 @@ function SessionView({
   );
 
   const clipboardSend = useCallback(async (): Promise<void> => {
+    if (session.boundaryClipboardWrite === false) {
+      push(
+        "warning",
+        "That computer takes clipboard text only while you have control, and only from a DeskVNC Support new enough to carry it",
+      );
+      return;
+    }
     const outcome = await pushClipboard(true);
     if (outcome === "unreadable") {
       push("warning", "Could not read the local clipboard");
       return;
     }
     if (outcome === "sent") push("success", "Clipboard sent to remote");
-  }, [pushClipboard, push]);
+  }, [pushClipboard, push, session.boundaryClipboardWrite]);
 
   const changeQuality = useCallback((q: QualityPreset): void => {
     setQualityState(q);
@@ -2132,6 +2221,7 @@ function SessionView({
             isChange: session.certPrompt.isChange,
             hostName: session.desktopName,
             scheme: session.certPrompt.scheme,
+            certificate: session.certPrompt.certificate,
           }}
           onTrust={() => session.trustCertificate(true)}
           onConnectOnce={() => session.trustCertificate(false)}

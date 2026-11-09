@@ -11,6 +11,9 @@ Download the file for your platform from the
 | Debian, Ubuntu | `DeskVNCViewer_<version>_amd64.deb` |
 | Fedora, RHEL | `DeskVNCViewer-<version>-1.x86_64.rpm` |
 | Any x64 Linux | `DeskVNCViewer_<version>_amd64.AppImage` |
+| Raspberry Pi 4 or 5 (64-bit Raspberry Pi OS), ARM64 Debian or Ubuntu | `DeskVNCViewer_<version>_arm64.deb` |
+| ARM64 Fedora, RHEL | `DeskVNCViewer-<version>-1.aarch64.rpm` |
+| Any ARM64 Linux | `DeskVNCViewer_<version>_aarch64.AppImage` |
 
 ## macOS
 
@@ -71,11 +74,16 @@ signed the same way. Releases before 0.27.10 are unsigned.
 
 ```sh
 sudo apt install ./DeskVNCViewer_<version>_amd64.deb      # Debian, Ubuntu
+sudo apt install ./DeskVNCViewer_<version>_arm64.deb      # Raspberry Pi OS 64-bit, ARM64
 sudo dnf install ./DeskVNCViewer-<version>-1.x86_64.rpm   # Fedora, RHEL
 
 chmod +x DeskVNCViewer_<version>_amd64.AppImage           # anywhere else
 ./DeskVNCViewer_<version>_amd64.AppImage
 ```
+
+The ARM64 packages need a 64-bit system. On a Raspberry Pi, `uname -m` prints
+`aarch64` on 64-bit Raspberry Pi OS; the older 32-bit system (`armv7l`) cannot
+run them.
 
 Packages are unsigned and not in any repository, so your package manager may
 warn about an untrusted origin.
@@ -90,6 +98,21 @@ The AppImage needs FUSE. On a system without it, extract instead:
 Credentials go to the Secret Service (GNOME Keyring, KWallet). On a headless or
 minimal system with no Secret Service running, the app falls back to an
 encrypted file protected by a master password you choose.
+
+DeskVNC Support for Linux is a tarball with the program, its app menu entry and
+its icon. It runs from wherever you unpack it:
+
+```sh
+tar -xzf DeskVNC-Support-Linux-x86_64.tar.gz      # or -aarch64 on ARM64
+./deskvnc-support --install    # once: adds it to your app menu with its icon
+./deskvnc-support
+```
+
+`--install` copies the program to `~/.local/share/deskvnc-support/`, writes
+`deskvnc-support.desktop` and the icon under `~/.local/share`, and points the
+menu entry at that copy. It needs no administrator, and the folder you unpacked
+the tarball into can be deleted afterwards. Run it again from a newer tarball to
+update the installed copy.
 
 ## Verifying a download
 

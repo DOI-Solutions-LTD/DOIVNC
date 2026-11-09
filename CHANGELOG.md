@@ -8,7 +8,275 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 While the version stays below 1.0, minor releases may contain breaking changes
 to stored data and to the IPC contract between the Rust core and the frontend.
 
-## [Unreleased]
+## [0.35.3] (2026-11-09)
+
+### Fixed
+
+* An agent could not type on a computer running DeskVNC Support for Windows or
+  macOS for up to twenty seconds after the screen moved, and not at all while
+  it kept moving. The graphics encoder there made H.264 that the agent's own
+  decoder ran out of buffers on, so its picture went stale and typing was
+  refused. Support now asks Media Foundation and VideoToolbox for Constrained
+  Baseline, checks what they really produced, and encodes in software when
+  they do not comply. The agent's picture also asks for a fresh screen as soon
+  as it loses its place. Baseline video is somewhat larger on the wire.
+* With control off on a Boundary computer, typing is refused with the same
+  view only reason a click gets, instead of asking the agent to look again.
+* `dvv open` named a session id the caller never passed. It now opens an
+  unsaved machine by its address, accepts a limb id, and says what it was
+  given.
+
+## [0.35.2] (2026-11-08)
+
+### Fixed
+
+* A running network scan could not be stopped. While a scan runs, the Scan
+  network button now reads Stop scan with its progress, and clicking it,
+  pressing Escape on it or choosing Stop scan in the command palette ends the
+  scan within a fraction of a second. Hosts already found stay in the list,
+  and closing the window that started a scan stops it too.
+
+## [0.35.1] (2026-11-08)
+
+### Added
+
+* The Scan network button has its own arrow. It lists every network this
+  computer can reach, with its range and how many addresses it covers: the
+  LAN, VPNs, the ranges Cloudflare WARP routes, ranges behind a gateway, and
+  Docker or other virtual bridges last. Pick one to scan only that, or type a
+  range. Anything larger than a /22 asks first, anything larger than a /16 or
+  outside private address space is refused, and the last pick is remembered.
+
+### Fixed
+
+* A large scan set up every connection it would ever make at the start and
+  held them all in memory. It now starts a new one only as another finishes,
+  so memory stays flat: a /16 went from about 268 MB to under 10 MB in the
+  same time.
+* The scan's progress bar read full when the scan was only a third done.
+
+## [0.35.0] (2026-11-08)
+
+### Added
+
+* macOS Screen Sharing, natively. DeskVNC logs in to a Mac with Apple's SRP
+  sign in (security types 33 and 36), falls back to the older Diffie Hellman
+  login (type 30) where that is all a Mac offers, and runs the whole session
+  inside Apple's encrypted channel. Picture, keyboard, pointer, macOS
+  shortcuts and clipboard both ways work against macOS 26, with no extra
+  virtual display added to the Mac. Tested against a real Mac.
+* Clipboard over Boundary. A helper's copied text can be pasted on the
+  computer they help while they have control, and the person can tick "Also
+  let them see what I copy" (off by default, per helper for unattended
+  access, never at the sign in screen). Works on Windows, macOS, Linux X11
+  and GNOME Wayland, in DeskVNC Support and in the DeskVNC viewer, including
+  `dvv_clipboard`. Older peers carry on exactly as before.
+* On GNOME, DeskVNC Support asks for the clipboard in the sharing prompt and
+  explains when a permission remembered by an older version leaves it out,
+  with a Share again button.
+* `deskvnc-support --help` and `--version` print and exit.
+
+### Changed
+
+* `deskvnc-support --install` copies the program under `~/.local/share`, so
+  the menu entry keeps working after the unpacked folder is deleted.
+* Support says invitation, not code, when no code service is set, and the
+  expiry line counts down.
+* A refused Mac login says when the password was right but the account is not
+  allowed under Remote Management, Options.
+* dvv can see and drive a desktop up to 6K, and status answers on any size.
+  Limbs an agent only looked at no longer use up its four limb allowance.
+* A DeskVNC viewer helping from Linux asks a Boundary computer for tiles
+  instead of H.264. WebKitGTK decodes video on the GPU with no software
+  choice, and on an older AMD card that locked the graphics card.
+* A Boundary helper's clipboard goes to the other computer only when the
+  helper pastes or presses Send clipboard, never just because control was
+  granted or the window regained focus.
+
+### Fixed
+
+* The Linux viewer's Boundary picture froze for up to a minute while the
+  screen moved, because WebKitGTK refused the video format and every picture
+  until the next keyframe was dropped.
+* A helper ending a session normally showed as a red "connection lost" error.
+  Support now says "They ended the session".
+* dvv offered control on a Boundary computer that lets the helper only watch.
+* A Mac on macOS 26 froze after the first picture. The first full picture of
+  a 4K Mac now arrives in about two seconds instead of twenty.
+* A Mac's host key prompt came back after every automatic reconnect.
+* GNOME restored a remembered view only share silently, so a helper given
+  control could only watch. Support now asks again.
+* A helper given a view only grant is told it can only watch; its input is
+  refused instead of ending the session.
+* Control ticked while the desktop was still opening never reached the helper.
+* "Your screen is being shared" no longer shows while GNOME's prompt is open,
+  and Cancel in that prompt is no longer blamed on a missing portal.
+* A typed paste into a host could turn its letters into shortcuts.
+* Plainer wording when a helper drops or a prompt times out, a stale "Helper
+  stopped responding" after a helper reconnects, and a long error that ran out
+  of the window.
+* The quick connect bar could switch an address to RDP when Connect was
+  clicked, and a suggestion under the pointer won on Enter.
+* `dvv_open` with slot 1 opened slot 0, a status read logged a typing refusal
+  four times a second, and a finished clipboard request stayed "in flight".
+
+## [0.34.1] (2026-11-07)
+
+### Added
+
+* Releases carry one SHA256SUMS.txt covering every file, the viewer installers
+  included.
+* DeskVNC Support on Linux ships a .desktop file and icon. Run
+  `./deskvnc-support --install` once after unpacking and the dock shows the
+  DeskVNC icon. It writes only under your own home folder.
+* On GNOME Wayland, Support reminds the person to switch on Allow Remote
+  Interaction when they allow control, since GNOME's dialog starts with it off.
+
+### Changed
+
+* Support calls itself DeskVNC Support in its window, header, notifications and
+  messages.
+* The Windows agent pipe is named per user and per login session, so a viewer
+  in a second session (an RDP login, say) no longer takes the plane from the
+  console's agents. Update DeskVNCViewer and dvv together.
+* `dvv_wait` reports `clampedMs`, `limitMs`, a measured `waitedMs` and its
+  outcome as JSON fields.
+
+### Fixed
+
+* DeskVNC Support for Linux is built on Ubuntu 22.04 again, so it starts on
+  Debian 12 and Raspberry Pi OS. The 0.34.0 build needed glibc 2.39.
+* Support no longer redraws ten times a second while idle. On a machine with no
+  graphics driver that kept a quarter of a core busy.
+* The Approve this helper notification goes away once the question is answered
+  or withdrawn.
+* A helper is told the screen is locked or asleep when GNOME refuses to share
+  it for that reason, instead of being told a portal service is missing.
+* Support keeps the desktop from going idle while a helper is connected, so a
+  view only session no longer ends when GNOME blanks the screen.
+* On Wayland a session ends with a reason when GNOME takes the shared screen
+  away on lock, blanking or a display change, instead of freezing.
+* VNC clipboard text reaches apps behind libvncserver 0.9.14 servers such as
+  x11vnc, which announce extended clipboard without notify and drop provided
+  text.
+* `dvv_close` ends a session an agent opened and works on an available limb.
+* A machine saved after dvv started opens once instead of being dialled twice.
+* `dvv_clipboard get` returns the text the machine last copied.
+* Terminal limbs refuse screen reads and text waits in terminal terms and point
+  at `dvv_run`, and an SSH limb attaches without a mirror.
+* An agent's file sidecar signs in to an SSH host the way the host was saved.
+* A deep probe returns the server's refusal and reason instead of an empty
+  list.
+
+## [0.34.0] (2026-11-07)
+
+### Added
+
+* RD Gateway. An RDP host can connect through a gateway over its HTTP
+  transport, over WebSocket, or over the older RDG_OUT_DATA and RDG_IN_DATA
+  pair. It signs in with NTLM, the computer's account, a separate gateway
+  account or an imported PAA cookie, and asks before trusting the gateway's
+  certificate.
+
+* Import a `.rdp` file into a new host from the Library, the command palette
+  or the File menu. Screen mode, size, smart sizing, audio, clipboard, the
+  account and an RD Gateway come across.
+
+* RDP licensing. DeskVNC completes the licensing exchange instead of
+  declining it and keeps the issued licence per server, so a Per Device
+  Session Host records the device and stops warning that the session ends in
+  sixty minutes.
+
+* When no keyring can store passwords (a Linux desktop with no default
+  keyring, for example), DeskVNC asks once for a master password for its own
+  encrypted file and saves the password that was waiting for it. Preferences >
+  Security says where passwords are kept, and a failed save is shown instead
+  of dropped.
+
+* The RDP and RD Gateway trust prompts show the certificate's Thumbprint
+  (SHA-1, as Windows shows it) and its SHA-256 next to the public key hash,
+  so an admin can match what a Windows dialog says.
+
+* Switching on unattended access in DeskVNC Support also sets it up at the
+  sign in screen, so the computer can be reached after a restart without a
+  second checkbox.
+
+* DeskVNC Support asks for attention when a helper waits for approval, and a
+  background start no longer hides the question.
+
+* The agent mirror decodes Boundary video, so an agent can see a screen that
+  is moving.
+
+* `dvv_click`, `dvv_type` and `dvv_key` take `look`: the action waits for the
+  screen to change and then settle, and returns the picture in the same call.
+  One call where an agent made three. On a short PowerShell job on a Windows
+  laptop that went from 12 calls and 15.4 s to 4 calls and 11.1 s, and each
+  call saved is one fewer turn of the agent's own model.
+
+* The fast lane, an experiment in `tools/fastlane` with its own reader,
+  `deskvnc-sense`. The agent writes a plan once; a loop with no model in it
+  carries the plan out over a table of the screen's controls read through UI
+  Automation, finding each control by name and waiting only when a step says
+  what the screen should show. No model is needed; the open jevos decision
+  model can be set to break ties. Two chained missions on a Windows laptop
+  (web lookups, Calculator, Excel, Word, PowerPoint, Notepad, filing) passed
+  16 skills of 16 in 6.3 minutes and closed every window they opened.
+
+* Linux builds for 64-bit ARM: a deb, an rpm and an AppImage of the viewer,
+  and DeskVNC Support as `DeskVNC-Support-Linux-aarch64.tar.gz`. They run on a
+  Raspberry Pi 4 or 5 with 64-bit Raspberry Pi OS and on other ARM64 Linux.
+
+### Changed
+
+* `dvv mcp` starts DeskVNCViewer only when an agent asks for saved machines or
+  opens one, and starts it minimised. Starting the server, `tools/list` and
+  `dvv_limbs` no longer open a window. `DVV_NO_START=1` turns starting it off.
+
+* Every Rust and npm dependency is on its newest compatible release, which
+  clears the vite, launch-editor and unic advisories.
+
+* The release workflow pins every action to a full commit hash.
+
+### Fixed
+
+* A helper connects again within seconds when DeskVNC Support on the other
+  computer quits, restarts or is stopped by the system. It used to wait for a
+  timeout, and on 0.32 it never came back. Boundary also connects again when
+  the computer restarts and waits for a busy one instead of ending.
+
+* A Boundary computer answers every helper. A second helper on the same
+  invitation is told someone is already asking, a prompt goes away when its
+  helper leaves, and unattended knocks that arrive together are each served.
+
+* SFTP uploads no longer truncate the file they just wrote to zero bytes.
+
+* The Files panel and the session terminal sign in with the SSH user and port
+  saved on the host instead of the local user on port 22.
+
+* An RDP session survives a reactivation (a resize, or a reconnect on the
+  server) with its dynamic channels open. The next channel request used to
+  end it as a protocol violation.
+
+* Text typed or dictated into an RDP session no longer turns into repeats of
+  its last character when the remote window is busy.
+
+* Clipboard pushes to x11vnc and other libvncserver servers no longer drop the
+  connection, and copying the same remote text twice delivers it twice.
+
+* `dvv_screen` works against x11vnc and TigerVNC, which split updates at any
+  pixel and left tiles along those edges unknown.
+
+* Unattended access shows as on once DeskVNC answers for the computer, instead
+  of Starting for as long as it runs.
+
+* Session > File Transfer is greyed out on an SSH tab and says why. It used to
+  stay enabled and do nothing.
+
+* dvv attaches a limb again when its connection to the viewer was replaced.
+
+* `screen-stable` and `screen-changed` ignore changes the size of a blinking
+  caret or a ticking clock. A screen with PowerShell open never counted as
+  still before, so every wait ran to its timeout: 91 s of a 157 s install.
 
 ## [0.33.0] (2026-10-30)
 

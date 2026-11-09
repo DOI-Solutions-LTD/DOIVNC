@@ -29,8 +29,10 @@ import {
 } from "../render/frameProtocol";
 import { encodeTerminalInput, encodeTerminalResize } from "../render/input";
 import type { PromptAnswer } from "../lib/credentials";
+import { nextRemoteClipboard, type RemoteClipboard } from "../lib/clipboardEcho";
 import { initTrace, traceMark } from "../render/trace";
 import type {
+  CertificateDigests,
   CredentialRequest,
   PinScheme,
   ProtocolKind,
@@ -82,6 +84,8 @@ export interface CertPromptState {
    * against the key the user actually verified. Never displayed.
    */
   scheme: PinScheme;
+  /** The certificate's thumbprint and SHA-256, for display only. */
+  certificate: CertificateDigests | null;
 }
 
 export interface SessionParams {
@@ -119,6 +123,13 @@ export interface SshHostKeyPromptState {
 
 export interface SessionApi {
   boundaryControl: boolean | null;
+  /**
+   * A Boundary session only: whether its computer puts text sent from here on
+   * its clipboard right now (while this helper has control there). `false`
+   * until the computer says so, and for good from one too old to carry a
+   * clipboard; `null` for every other protocol, whose clipboard is its own.
+   */
+  boundaryClipboardWrite: boolean | null;
   state: SessionState;
   desktopName: string;
   /**
@@ -139,7 +150,8 @@ export interface SessionApi {
    * across `retryConnect` on purpose: that is the case it exists for.
    */
   lastCredentialAnswer: PromptAnswer | null;
-  remoteClipboard: string | null;
+  /** A fresh value per arrival, so a repeat of the same text still lands. */
+  remoteClipboard: RemoteClipboard | null;
   bellTick: number;
   /**
    * Set once `ssh-attached` arrives; null before then, and for every non-SSH
@@ -331,13 +343,16 @@ export function useSession(
   const [state, setState] = useState<SessionState>({ state: "connecting" });
   const [desktopName, setDesktopName] = useState(params.name);
   const [boundaryControl, setBoundaryControl] = useState<boolean | null>(params.protocol === "boundary" ? false : null);
+  const [boundaryClipboardWrite, setBoundaryClipboardWrite] = useState<boolean | null>(
+    params.protocol === "boundary" ? false : null,
+  );
   const [screens, setScreens] = useState<RemoteScreen[]>([]);
   const [stats, setStats] = useState<SessionStats | null>(null);
   const [certPrompt, setCertPrompt] = useState<CertPromptState | null>(null);
   const [sshHostKeyPrompt, setSshHostKeyPrompt] = useState<SshHostKeyPromptState | null>(null);
   const [credentialRequest, setCredentialRequest] = useState<CredentialRequest | null>(null);
   const [lastCredentialAnswer, setLastCredentialAnswer] = useState<PromptAnswer | null>(null);
-  const [remoteClipboard, setRemoteClipboard] = useState<string | null>(null);
+  const [remoteClipboard, setRemoteClipboard] = useState<RemoteClipboard | null>(null);
   const [bellTick, setBellTick] = useState(0);
   const [sshAttached, setSshAttached] = useState<{ multiplexer: string | null; resumed: boolean } | null>(
     null,
@@ -476,6 +491,9 @@ export function useSession(
         case "boundary-control":
           setBoundaryControl(ev.control);
           break;
+        case "boundary-clipboard":
+          setBoundaryClipboardWrite(ev.write);
+          break;
         case "desktop-name":
           setDesktopName(ev.name);
           break;
@@ -486,7 +504,7 @@ export function useSession(
           bridgeRef.current.onCursorPosition(ev.x, ev.y);
           break;
         case "clipboard-text":
-          setRemoteClipboard(ev.text);
+          setRemoteClipboard((prev) => nextRemoteClipboard(prev, ev.text));
           break;
         case "clipboard-notify":
           // Formats only, no data. The session already answers a text notify
@@ -507,6 +525,8 @@ export function useSession(
             subject: ev.subject,
             isChange: ev.isChange,
             scheme: ev.scheme,
+            // An older shell sends no field at all; treat that as no digests.
+            certificate: ev.certificate ?? null,
           });
           break;
         case "credentials-required":
@@ -656,12 +676,18 @@ export function useSession(
         // The same safety net for Boundary's permission: it is announced once,
         // and a window that missed it would stay view only for good.
         if (params.protocol === "boundary") {
-          const permission = await safeInvoke<{ control: boolean } | null>(
+          const permission = await safeInvoke<{
+            control: boolean;
+            clipboard?: { write: boolean; read: boolean } | null;
+          } | null>(
             "boundary_permission",
             { sessionId: sessionIdRef.current },
             null,
           );
-          if (!cancelled && permission) setBoundaryControl(permission.control);
+          if (!cancelled && permission) {
+            setBoundaryControl(permission.control);
+            setBoundaryClipboardWrite(permission.clipboard?.write ?? false);
+          }
         }
 
         // Safety net for a prompt raised between the session starting and this
@@ -1021,7 +1047,7 @@ export function useSession(
   }, []);
 
   return {
-    state, desktopName, boundaryControl, screens, stats, certPrompt, sshHostKeyPrompt, credentialRequest, lastCredentialAnswer, remoteClipboard, bellTick,
+    state, desktopName, boundaryControl, boundaryClipboardWrite, screens, stats, certPrompt, sshHostKeyPrompt, credentialRequest, lastCredentialAnswer, remoteClipboard, bellTick,
     sshAttached, sshNotice,
     sendInput, sendTerminalInput, sendTerminalResize, disconnect, reconnectNow, setQuality, setViewOnly, refreshScreen,
     requestResize, sendClipboard, releaseAllKeys, captureThumbnail, trustCertificate, setAlwaysRefresh,

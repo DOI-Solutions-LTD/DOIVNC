@@ -151,12 +151,15 @@ fn main() {
             "delete_password",
             "credential_backend",
             "unlock_credentials",
+            "credential_status",
             // discovery
             "start_discovery",
             "stop_discovery",
             "scan_network",
+            "stop_scan",
             "deep_probe",
             "local_subnets",
+            "scan_networks",
             "wake_host",
             // sessions
             "connect_session",

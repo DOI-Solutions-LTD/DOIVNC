@@ -548,30 +548,53 @@ async function nativeOpen(options: Record<string, unknown>): Promise<string[]> {
   return list.map(one).filter((p): p is string => p !== null);
 }
 
+/**
+ * What reading a `.rdp` file gave (`vnc_store::RdpImport`): a draft profile,
+ * the username to pre-fill, and sentences about what did not come across.
+ * Never a password: the shell does not read that line.
+ */
+export interface RdpImport {
+  profile: HostProfile;
+  username: string | null;
+  mapped: string[];
+  ignored: string[];
+  unparseable: number;
+  warnings: string[];
+  desktopSize: [number, number] | null;
+}
+
+/** Ask the person for one `.rdp` file. `null` when they cancelled. */
+export async function pickRdpFile(): Promise<string | null> {
+  const picked = await nativeOpen({
+    multiple: false,
+    directory: false,
+    title: "Import a Remote Desktop file",
+    filters: [{ name: "Remote Desktop file", extensions: ["rdp", "RDP"] }],
+  });
+  return picked[0] ?? null;
+}
+
+/** Read a `.rdp` file into a draft. The shell reads it; nothing is saved. */
+export function importRdpFile(path: string): Promise<RdpImport> {
+  return mustInvoke<RdpImport>("import_rdp_file", { path });
+}
+
 /** Pick files to upload. */
 export function pickLocalFiles(title = "Choose files to send"): Promise<string[]> {
   return nativeOpen({ multiple: true, directory: false, title });
 }
 
-/** Pick one or more Microsoft `.rdp` files to import. */
-export function pickRdpFiles(title = "Import Remote Desktop files"): Promise<string[]> {
+/**
+ * Ask the person for one or more `.rdp` files. Empty when they cancelled.
+ * One file goes to the editor like `pickRdpFile`; several are saved in bulk.
+ */
+export function pickRdpFiles(): Promise<string[]> {
   return nativeOpen({
     multiple: true,
     directory: false,
-    title,
-    filters: [{ name: "Remote Desktop files", extensions: ["rdp"] }],
+    title: "Import Remote Desktop files",
+    filters: [{ name: "Remote Desktop file", extensions: ["rdp", "RDP"] }],
   });
-}
-
-/**
- * The draft a `.rdp` file describes (`vnc_store::RdpImport`). Only the fields
- * the library acts on are typed; the shell sends more.
- */
-export interface RdpImport {
-  profile: HostProfile;
-  /** The file's `username`, which may be `DOMAIN\user`. Never a password. */
-  username: string | null;
-  warnings: string[];
 }
 
 /** One row of `import_rdp_files`: a draft, or the reason there is none. */

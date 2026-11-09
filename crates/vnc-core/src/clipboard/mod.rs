@@ -10,12 +10,11 @@
 //! The length field is a SIGNED i32: positive = legacy Latin-1 text,
 //! negative = an extended-clipboard message of `abs(length)` bytes.
 
-use std::io::{Read, Write};
+use std::io::Read;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use flate2::read::ZlibDecoder;
-use flate2::write::ZlibEncoder;
-use flate2::Compression;
+use flate2::{Compress, Compression, FlushCompress};
 
 // ---------------------------------------------------------------------------
 // Flag constants (extended clipboard, PRD/07 §1.2)
@@ -57,6 +56,8 @@ pub const MAX_INBOUND_TEXT: usize = 10 * 1024 * 1024;
 #[derive(Debug, Default)]
 pub struct ClipboardState {
     extended: bool,
+    /// The flags word of the peer's caps message, 0 until one arrives.
+    peer_caps: u32,
     last_send_lossy: AtomicBool,
 }
 
@@ -73,6 +74,40 @@ impl ClipboardState {
 
     pub fn extended_supported(&self) -> bool {
         self.extended
+    }
+
+    /// Record the flags word of the peer's caps message.
+    pub fn set_peer_caps(&mut self, flags: u32) {
+        self.peer_caps = flags;
+    }
+
+    /// The peer announced it handles a `notify`.
+    pub fn peer_takes_notify(&self) -> bool {
+        self.peer_caps & ACTION_NOTIFY != 0
+    }
+
+    /// An Extended Clipboard peer that should also get a legacy Latin-1 copy
+    /// of outgoing text.
+    ///
+    /// libvncserver 0.9.14 (x11vnc, and every other server built on it in
+    /// Ubuntu 24.04 and Debian 12) announces the extension to every client
+    /// with one fixed caps word: text, with caps, request, peek and provide,
+    /// and no notify. It passes provided text to a `setXCutTextUTF8` hook
+    /// whose default does nothing, and x11vnc never sets that hook, so a
+    /// `provide` is dropped while a legacy ClientCutText is applied.
+    /// libvncserver 0.9.15 announces the same word, but only when the
+    /// application set the hook. Nothing on the wire tells the two apart, so
+    /// the absence of `notify` is the signal, and the legacy copy goes out
+    /// ahead of the `provide`, so a server that takes both ends on the
+    /// lossless text. TigerVNC, KasmVNC and RealVNC announce `notify`, and
+    /// TigerVNC takes the selection on a legacy message, so they never get
+    /// one. A peer whose caps cannot take a text `provide` at all gets one
+    /// too, since otherwise it would get nothing.
+    pub fn wants_legacy_copy(&self) -> bool {
+        self.extended
+            && (self.peer_caps & ACTION_NOTIFY == 0
+                || self.peer_caps & ACTION_PROVIDE == 0
+                || self.peer_caps & FORMAT_TEXT == 0)
     }
 
     /// True when the most recent legacy send had to alter characters
@@ -151,6 +186,7 @@ pub fn handle_server_cut_text(state: &mut ClipboardState, data: &[u8]) -> Option
         // The server speaks Extended Clipboard; remember it. Real servers
         // ignore advertised sizes, so we do not parse them beyond validity.
         state.set_extended_supported(true);
+        state.set_peer_caps(flags);
         return None;
     }
     if flags & ACTION_PROVIDE != 0 {
@@ -222,7 +258,13 @@ pub fn encode_client_cut_text(state: &ClipboardState, text: &str) -> Vec<u8> {
         state.last_send_lossy.store(false, Ordering::Relaxed);
         return encode_provide_text(text);
     }
-    // Legacy path: Latin-1, LF line endings.
+    encode_legacy_text(state, text)
+}
+
+/// Build a legacy ClientCutText message BODY: Latin-1 with LF line endings,
+/// transliterated where it has to be (see
+/// [`ClipboardState::last_send_was_lossy`]).
+pub fn encode_legacy_text(state: &ClipboardState, text: &str) -> Vec<u8> {
     let normalized = crlf_to_lf(text);
     let (latin1, lossy) = to_latin1(&normalized);
     state.last_send_lossy.store(lossy, Ordering::Relaxed);
@@ -243,6 +285,12 @@ pub fn encode_request(formats: u32) -> Vec<u8> {
 /// Build an extended-clipboard `provide` carrying text. The payload is a
 /// zlib stream of `u32 size + data` per format in flag order; text data is
 /// UTF-8 with CRLF line endings and a trailing NUL.
+///
+/// The stream is sync flushed and never finished, the way TigerVNC's own
+/// client writes it. libvncserver (x11vnc, krfb and others) inflates each
+/// format expecting `Z_OK` and treats `Z_STREAM_END` as an error, so a
+/// finished stream made it drop the connection on the first clipboard push,
+/// and since every reconnect pushes the clipboard again it never stayed up.
 pub fn encode_provide_text(text: &str) -> Vec<u8> {
     let mut data = lf_to_crlf(&crlf_to_lf(text)).into_bytes();
     data.push(0);
@@ -251,12 +299,23 @@ pub fn encode_provide_text(text: &str) -> Vec<u8> {
     raw.extend_from_slice(&(data.len() as u32).to_be_bytes());
     raw.extend_from_slice(&data);
 
-    let mut enc = ZlibEncoder::new(Vec::new(), Compression::default());
-    // Writing to a Vec cannot fail.
-    let _ = enc.write_all(&raw);
-    let compressed = enc.finish().unwrap_or_default();
+    frame_extended(ACTION_PROVIDE | FORMAT_TEXT, &zlib_sync_flushed(&raw))
+}
 
-    frame_extended(ACTION_PROVIDE | FORMAT_TEXT, &compressed)
+/// One zlib stream holding `raw`, ended with a sync flush and no trailer.
+fn zlib_sync_flushed(raw: &[u8]) -> Vec<u8> {
+    let mut z = Compress::new(Compression::default(), true);
+    let mut out = Vec::with_capacity(raw.len() + 64);
+    loop {
+        let consumed = z.total_in() as usize;
+        // Compressing into a Vec cannot fail; the room left over is how a
+        // finished flush is told apart from one that ran out of space.
+        let _ = z.compress_vec(&raw[consumed..], &mut out, FlushCompress::Sync);
+        if z.total_in() as usize == raw.len() && out.len() < out.capacity() {
+            return out;
+        }
+        out.reserve(out.capacity().max(64));
+    }
 }
 
 /// Our capabilities announcement: text + rtf + html accepted, with every
@@ -317,6 +376,8 @@ fn to_latin1(s: &str) -> (Vec<u8>, bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use flate2::write::ZlibEncoder;
+    use std::io::Write;
 
     fn legacy_server_msg(text: &[u8]) -> Vec<u8> {
         let mut v = vec![0, 0, 0];
@@ -370,6 +431,48 @@ mod tests {
         let got = handle_server_cut_text(&mut state, &msg);
         assert_eq!(got.as_deref(), Some("héllo 😀\nsecond line"));
         assert!(state.extended_supported());
+    }
+
+    #[test]
+    fn provide_inflates_the_way_libvncserver_reads_it() {
+        // libvncserver 0.9.14, rfbProcessExtendedServerCutTextData: inflate
+        // four bytes of size, then `size` bytes of data, and anything but
+        // Z_OK from either call closes the client.
+        use flate2::{Decompress, FlushDecompress, Status};
+        for text in [
+            "a",
+            "push-to-x11vnc-1794007296",
+            &"long line
+"
+            .repeat(5000),
+        ] {
+            let msg = encode_provide_text(text);
+            let compressed = &msg[11..];
+            let mut z = Decompress::new(true);
+            let mut size = [0u8; 4];
+            let status = z
+                .decompress(compressed, &mut size, FlushDecompress::None)
+                .unwrap();
+            assert_eq!(status, Status::Ok, "size read for {} bytes", text.len());
+            let size = u32::from_be_bytes(size) as usize;
+            let mut data = vec![0u8; size];
+            let mut got = 0;
+            while got < size {
+                let before_out = z.total_out();
+                let before_in = z.total_in() as usize;
+                let status = z
+                    .decompress(
+                        &compressed[before_in..],
+                        &mut data[got..],
+                        FlushDecompress::None,
+                    )
+                    .unwrap();
+                assert_eq!(status, Status::Ok, "data read for {} bytes", text.len());
+                got += (z.total_out() - before_out) as usize;
+            }
+            assert_eq!(&data[..size - 1], lf_to_crlf(text).as_bytes());
+            assert_eq!(data[size - 1], 0);
+        }
     }
 
     #[test]
@@ -433,6 +536,40 @@ mod tests {
             Some("émoji 😀")
         );
         assert!(!state.last_send_was_lossy());
+    }
+
+    fn caps_msg(flags: u32, sizes: &[u32]) -> Vec<u8> {
+        let mut v = vec![0, 0, 0];
+        v.extend_from_slice(&(-(4 + 4 * sizes.len() as i32)).to_be_bytes());
+        v.extend_from_slice(&flags.to_be_bytes());
+        for s in sizes {
+            v.extend_from_slice(&s.to_be_bytes());
+        }
+        v
+    }
+
+    #[test]
+    fn only_a_peer_without_notify_wants_a_legacy_copy() {
+        // Before any caps: legacy is the only path anyway, not a copy.
+        assert!(!ClipboardState::new().wants_legacy_copy());
+
+        // libvncserver 0.9.14 and 0.9.15, as captured from x11vnc 0.9.16.
+        let mut lvs = ClipboardState::new();
+        handle_server_cut_text(&mut lvs, &caps_msg(0x1700_0001, &[1 << 20]));
+        assert!(lvs.extended_supported());
+        assert!(!lvs.peer_takes_notify());
+        assert!(lvs.wants_legacy_copy());
+
+        // TigerVNC 1.13 Xvnc, as captured.
+        let mut tiger = ClipboardState::new();
+        handle_server_cut_text(&mut tiger, &caps_msg(0x1f00_0001, &[0]));
+        assert!(tiger.peer_takes_notify());
+        assert!(!tiger.wants_legacy_copy());
+
+        // Notify but no text format: a provide cannot carry text to it.
+        let mut no_text = ClipboardState::new();
+        handle_server_cut_text(&mut no_text, &caps_msg(0x1f00_0004, &[0]));
+        assert!(no_text.wants_legacy_copy());
     }
 
     #[test]

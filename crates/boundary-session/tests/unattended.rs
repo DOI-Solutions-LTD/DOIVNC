@@ -208,6 +208,7 @@ async fn a_helper_paired_in_person_comes_back_unattended_and_others_are_refused(
                     let _ = answer.send(unattended::Asked {
                         approval: Approval::Deny,
                         tools: false,
+                        clipboard: false,
                         pair: false,
                     });
                     break;
@@ -239,6 +240,7 @@ async fn a_helper_paired_in_person_comes_back_unattended_and_others_are_refused(
                     let _ = answer.send(unattended::Asked {
                         approval: Approval::Control,
                         tools: true,
+                        clipboard: false,
                         pair: true,
                     });
                 }
@@ -685,6 +687,78 @@ async fn a_paired_helper_reaches_a_machine_by_its_address_alone() {
     .expect("timed out");
 }
 
+/// Everything a helper read while it connected, up to being let in.
+async fn said_until_in(session: &mut Session) -> Vec<String> {
+    let mut said = Vec::new();
+    loop {
+        match session.events.recv().await {
+            Some(Event::Status(status)) => said.push(status),
+            Some(Event::Connected { .. }) => return said,
+            Some(Event::Finished(result)) => panic!("ended before it was in: {result:?}"),
+            None => panic!("the session went quiet"),
+            _ => {}
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_paired_helper_is_not_told_a_person_must_approve() {
+    if skipped() {
+        return;
+    }
+    timeout(Duration::from_secs(60), async {
+        let dir = scratch("wording");
+        let access_path = dir.join("access.json");
+        let machine_key = unattended::load_or_create_key(&dir.join("machine.key")).unwrap();
+        let helper_key = unattended::load_or_create_key(&dir.join("helper.key")).unwrap();
+        let mut access = Access::default();
+        access.enabled = true;
+        access
+            .trust(&helper_key.public().to_string(), "Sam", true)
+            .unwrap();
+        access.save(&access_path).unwrap();
+        let mut listener =
+            unattended::listen(local(), machine_key, access_path, || Ok(Box::new(Fake)));
+        let address = loop {
+            match listener.notices.recv().await {
+                Some(Notice::Ready { address, .. }) => break address,
+                Some(Notice::Finished(result)) => panic!("listener ended: {result:?}"),
+                _ => {}
+            }
+        };
+        // Dialled by address, as the test above does, since nothing here
+        // publishes the machine's ID.
+        let picked = address
+            .ip_addrs()
+            .find(|a| a.is_ipv4() && !a.ip().is_loopback())
+            .or_else(|| address.ip_addrs().next())
+            .copied()
+            .expect("a direct address");
+        let ip = if picked.ip().is_unspecified() {
+            "127.0.0.1".parse().unwrap()
+        } else {
+            picked.ip()
+        };
+        let typed = format!("{ip}:{}", picked.port());
+        let mut helper = unattended::connect(typed, "Sam".into(), None, helper_key, local());
+        let said = said_until_in(&mut helper).await;
+        // Nobody was asked: the computer let a paired helper straight in.
+        assert!(
+            !said.iter().any(|s| s.contains("approve")),
+            "the helper read {said:?}"
+        );
+        assert!(
+            said.iter()
+                .any(|s| s == "Waiting for the computer to let you in"),
+            "the helper read {said:?}"
+        );
+        helper.stop();
+        listener.stop();
+    })
+    .await
+    .expect("timed out");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_address_with_nothing_listening_says_so() {
     if skipped() {
@@ -707,4 +781,209 @@ async fn an_address_with_nothing_listening_says_so() {
         .expect("timed out")
         .unwrap_err();
     assert!(error.contains("did not say which computer"), "{error}");
+}
+
+/// DeskVNC Support quitting under a helper, as it does when it is updated or
+/// restarted, is a lost link: the computer is coming back, and nobody there
+/// ended the session.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_computer_whose_support_app_stops_is_a_lost_link() {
+    if skipped() {
+        return;
+    }
+    timeout(Duration::from_secs(60), async {
+        let dir = scratch("restart");
+        let machine_key = unattended::load_or_create_key(&dir.join("machine.key")).unwrap();
+        let helper = unattended::load_or_create_key(&dir.join("helper.key")).unwrap();
+        let access_path = dir.join("access.json");
+        let mut access = Access::default();
+        access.enabled = true;
+        access
+            .trust(&helper.public().to_string(), "Helper", true)
+            .unwrap();
+        access.save(&access_path).unwrap();
+
+        let mut listener =
+            unattended::listen(local(), machine_key, access_path, || Ok(Box::new(Fake)));
+        let address = loop {
+            match listener.notices.recv().await {
+                Some(Notice::Ready { address, .. }) => break address,
+                Some(Notice::Finished(result)) => panic!("listener ended: {result:?}"),
+                _ => {}
+            }
+        };
+        let mut visit = unattended::connect_to(Ok(address), "Helper".into(), None, helper, local());
+        loop {
+            match visit.events.recv().await {
+                Some(Event::Connected { .. }) => break,
+                Some(Event::Finished(result)) => panic!("ended before connecting: {result:?}"),
+                Some(_) => {}
+                None => panic!("the helper's session went quiet"),
+            }
+        }
+        listener.stop();
+        let ended = loop {
+            match visit.events.recv().await {
+                Some(Event::Finished(result)) => break result,
+                Some(_) => {}
+                None => panic!("the helper's session went quiet"),
+            }
+        };
+        let ended = ended.expect_err("the computer went away");
+        assert!(LinkLost::is(&ended), "{ended:#}");
+    })
+    .await
+    .expect("timed out");
+}
+
+/// Quitting the app stops the listener and drops the session it held in the
+/// same moment. The helper still hears that the computer went away, every
+/// time: it used to be a coin toss whether it heard that or a plain end.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_support_app_that_quits_while_holding_the_session_is_a_lost_link() {
+    if skipped() {
+        return;
+    }
+    timeout(Duration::from_secs(90), async {
+        for round in 0..8 {
+            let dir = scratch(&format!("quit-{round}"));
+            let machine_key = unattended::load_or_create_key(&dir.join("machine.key")).unwrap();
+            let helper = unattended::load_or_create_key(&dir.join("helper.key")).unwrap();
+            let access_path = dir.join("access.json");
+            let mut access = Access::default();
+            access.enabled = true;
+            access
+                .trust(&helper.public().to_string(), "Helper", true)
+                .unwrap();
+            access.save(&access_path).unwrap();
+            let mut listener =
+                unattended::listen(local(), machine_key, access_path, || Ok(Box::new(Fake)));
+            let address = loop {
+                match listener.notices.recv().await {
+                    Some(Notice::Ready { address, .. }) => break address,
+                    Some(Notice::Finished(result)) => panic!("listener ended: {result:?}"),
+                    _ => {}
+                }
+            };
+            let visit = unattended::connect_to(Ok(address), "Helper".into(), None, helper, local());
+            let held = loop {
+                match listener.notices.recv().await {
+                    Some(Notice::Connected { session, .. }) => break session,
+                    Some(Notice::Finished(result)) => panic!("listener ended: {result:?}"),
+                    _ => {}
+                }
+            };
+            listener.stop();
+            drop(held);
+            let ended = outcome_after_connect(visit).await;
+            let ended = ended.expect_err("the computer went away");
+            assert!(LinkLost::is(&ended), "round {round}: {ended:#}");
+        }
+    })
+    .await
+    .expect("timed out");
+}
+
+/// How a helper session that connects ends.
+async fn outcome_after_connect(mut visit: Session) -> anyhow::Result<()> {
+    loop {
+        match visit.events.recv().await {
+            Some(Event::Finished(result)) => return result,
+            Some(_) => {}
+            None => panic!("the helper's session went quiet"),
+        }
+    }
+}
+
+/// A computer slower at taking keys than the helper is at sending them, as a
+/// Mac is while a malware scan holds every core, falls behind and catches up.
+/// It used to end the session once 128 keys were waiting.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_computer_that_falls_behind_on_keys_catches_up() {
+    use boundary_session::Key;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    struct Slow(Arc<AtomicUsize>);
+    impl Desktop for Slow {
+        fn capture(&mut self) -> anyhow::Result<Frame> {
+            Fake.capture()
+        }
+        fn input(&mut self, input: Input) -> anyhow::Result<()> {
+            if matches!(input, Input::Key { .. }) {
+                std::thread::sleep(Duration::from_millis(4));
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+            Ok(())
+        }
+        fn release(&mut self) {}
+    }
+    if skipped() {
+        return;
+    }
+    timeout(Duration::from_secs(60), async {
+        let dir = scratch("behind");
+        let machine_key = unattended::load_or_create_key(&dir.join("machine.key")).unwrap();
+        let helper = unattended::load_or_create_key(&dir.join("helper.key")).unwrap();
+        let access_path = dir.join("access.json");
+        let mut access = Access::default();
+        access.enabled = true;
+        access
+            .trust(&helper.public().to_string(), "Helper", true)
+            .unwrap();
+        access.save(&access_path).unwrap();
+        let taken = Arc::new(AtomicUsize::new(0));
+        let counter = taken.clone();
+        let mut listener = unattended::listen(local(), machine_key, access_path, move || {
+            Ok(Box::new(Slow(counter.clone())))
+        });
+        let address = loop {
+            match listener.notices.recv().await {
+                Some(Notice::Ready { address, .. }) => break address,
+                Some(Notice::Finished(result)) => panic!("listener ended: {result:?}"),
+                _ => {}
+            }
+        };
+        let mut visit = unattended::connect_to(Ok(address), "Helper".into(), None, helper, local());
+        let _held = loop {
+            if let Some(Notice::Connected { session, .. }) = listener.notices.recv().await {
+                break session;
+            }
+        };
+        loop {
+            match visit.events.recv().await {
+                Some(Event::Connected { control: true, .. }) => break,
+                Some(Event::Finished(result)) => panic!("ended before connecting: {result:?}"),
+                Some(_) => {}
+                None => panic!("the helper's session went quiet"),
+            }
+        }
+        const KEYS: usize = 600;
+        for n in 0..KEYS {
+            visit
+                .input(Input::Key {
+                    key: Key::Enter,
+                    down: n % 2 == 0,
+                })
+                .expect("the helper's own queue keeps up");
+            tokio::time::sleep(Duration::from_micros(500)).await;
+        }
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        while taken.load(Ordering::SeqCst) < KEYS {
+            if let Ok(Some(Event::Finished(result))) =
+                tokio::time::timeout(Duration::from_millis(50), visit.events.recv()).await
+            {
+                panic!("the session ended: {result:?}");
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "only {} keys arrived",
+                taken.load(Ordering::SeqCst)
+            );
+        }
+        listener.stop();
+    })
+    .await
+    .expect("timed out");
 }

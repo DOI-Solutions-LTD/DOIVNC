@@ -237,7 +237,8 @@ direction, but it still fails.
 | `saved_user_names` | `invoke("saved_user_names", { hostId })` | `{ vncUser, rdpUser, rdpDomain, sshUser }`, each `string \| null` |
 | `delete_password` | `invoke("delete_password", { hostId })` | `void` |
 | `credential_backend` | `invoke("credential_backend")` | `"OsKeychain" \| "EncryptedFile" \| "Locked"` |
-| `unlock_credentials` | `invoke("unlock_credentials", { masterPassword })` | `void` |
+| `unlock_credentials` | `invoke("unlock_credentials", { masterPassword })` | `string[]`: host ids whose saves waited for the unlock and are now written. Creates the encrypted file the first time. |
+| `credential_status` | `invoke("credential_status")` | `{ backend, vaultExists, parkedSaves }` |
 
 `creds` is a `StoredCredentials`:
 `{ vncPassword? vencryptUser? vencryptPass? sshPassphrase? rdpUser? rdpDomain?
@@ -281,9 +282,11 @@ camelCase switch still deserialize.
 |---|---|---|
 | `start_discovery` | `invoke("start_discovery")` | `void` (idempotent mDNS browse) |
 | `stop_discovery` | `invoke("stop_discovery")` | `void` |
-| `scan_network` | `invoke("scan_network", { subnets? })` | `void`, `subnets` is a list of CIDR strings; omit for the safe local interfaces. Errors if a scan is already running. |
+| `scan_network` | `invoke("scan_network", { subnets?, allowLarge? })` | `void`, `subnets` is a list of CIDR strings (a bare address means that one address); omit for the safe local interfaces. Named ranges must be private and no larger than a /16, and ranges adding up to more than a /22 need `allowLarge: true`, which the UI sends only after the person confirmed the count. Errors if a scan is already running. |
+| `stop_scan` | `invoke("stop_scan")` | `boolean`, true when a scan was running and has been told to stop. No new probes start, the ones in flight are aborted, and the scan ends the usual way with `scan-complete` and the count found so far; hosts it found stay listed. False when nothing was scanning. Closing the window that started a scan, or quitting, stops it too. |
 | `deep_probe` | `invoke("deep_probe", { address, port, protocol? })` | `{ protocol: "vnc", securityTypes: number[] }` or `{ protocol: "rdp", rdp: RdpCaps }` |
 | `local_subnets` | `invoke("local_subnets")` | `string[]` of CIDRs (VPN/tunnel interfaces excluded) |
+| `scan_networks` | `invoke("scan_networks")` | `ScanNetwork[]`: `{ id, name, kind, interface, range, cidrs, addresses, verdict }`, the networks this computer can scan, read from its interfaces and its IPv4 routes. `kind` is `"lan"`, `"vpn"`, `"warp"`, `"routed"` or `"virtual"`, in that order; `verdict` is `"scan"`, `"confirm"`, `"too-large"` or `"public"`. |
 | `wake_host` | `invoke("wake_host", { profileId })` | `void`, note **`profileId`**, not `hostId` |
 
 `deep_probe` dispatches on `protocol`, which the caller passes and the shell
@@ -642,6 +645,13 @@ launch.
 
 ## Events
 
+### `credential-store-locked`, a save waiting for the master password
+
+Emitted to every window when a save reached the encrypted credential file
+while it was locked. The shell keeps the credential in memory and writes it
+when `unlock_credentials` succeeds; the main window asks for the master
+password. Payload: `{ "hostId": "…" }`.
+
 ### `session://event`, per-session control (JSON)
 
 Emitted with `emit_to(window_label, …)`, so only the session's own window
@@ -661,7 +671,7 @@ discriminator, there is no nested `event` object.
 | `clipboard-text` | `text`, **untrusted** |
 | `clipboard-notify` | `formats` (u32 bitmask) |
 | `bell` |, |
-| `certificate-prompt` | `fingerprint`, `subject`, `isChange`, `scheme` (**camelCase**). `scheme` is `"tls"` (VeNCrypt X.509), `"ra2"` (RealVNC RSA) or `"rdp-tls"` (an RDP server's own certificate). It is plumbing, not copy: the UI hands it back to `trust_certificate` unchanged so the pin lands under the key the user actually looked at. One host can serve VNC over VeNCrypt and RDP on 3389 with two unrelated certificates, and sharing one row would mean a certificate approved for one protocol silently vouching for the other |
+| `certificate-prompt` | `fingerprint`, `subject`, `isChange`, `scheme` (**camelCase**). `scheme` is `"tls"` (VeNCrypt X.509), `"ra2"` (RealVNC RSA) or `"rdp-tls"` (an RDP server's own certificate). It is plumbing, not copy: the UI hands it back to `trust_certificate` unchanged so the pin lands under the key the user actually looked at. One host can serve VNC over VeNCrypt and RDP on 3389 with two unrelated certificates, and sharing one row would mean a certificate approved for one protocol silently vouching for the other. `certificate` is `{ thumbprint, sha256 }` (colon separated hex) for a key that came in an X.509 certificate, and `null` for a bare RA2 key: `thumbprint` is the certificate's SHA-1, which Windows shows as Thumbprint, and `sha256` is the certificate's SHA-256. Both are for matching by eye; `fingerprint` (the SHA-256 of the public key) is still the only value pinned |
 | `credentials-required` | `request`, a `CredentialRequest` (**camelCase**); the session is PAUSED until `provide_credentials`/`cancel_credentials` |
 | `stats` | `stats`, `SessionStats`, fields **snake_case** |
 | `error` | `message` |
@@ -1169,7 +1179,7 @@ this id from the list".
 ### `discovery://scan-complete`, app-wide (JSON)
 
 Payload is `string | null`: an error message, or `null` on success. Emitted
-once when a `scan_network` run finishes, in addition to the
+once when a `scan_network` run finishes or is stopped, in addition to the
 `{ type: "scan-complete" }` event above.
 
 ---

@@ -94,6 +94,7 @@ async fn connect(encoders: Option<VideoEncoders>, video: bool) -> Pair {
         Abilities {
             tools: false,
             video,
+            clipboard: false,
         },
     );
     loop {
@@ -235,6 +236,17 @@ async fn moving_screens_come_as_h264_and_settle_back_to_sharp_tiles() {
             asked.iter().any(|(_, u)| whole(u)),
             "a refresh sends the whole screen"
         );
+        // Video after it starts from a keyframe, so a decoder that lost its
+        // place, which is why a helper asks, can follow it again.
+        let after_whole = asked
+            .iter()
+            .skip_while(|(_, u)| !whole(u))
+            .find_map(|(_, u)| match u {
+                Update::Video(unit) => Some(unit),
+                _ => None,
+            })
+            .expect("video goes on after the whole screen");
+        assert!(after_whole.fresh && after_whole.keyframe);
         window.draw(&asked);
 
         // The screen stops.

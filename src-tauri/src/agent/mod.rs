@@ -46,6 +46,7 @@ pub mod control;
 pub mod mirror;
 pub mod requests;
 pub mod server;
+pub mod video;
 pub mod wire;
 
 use std::collections::HashMap;
@@ -129,8 +130,13 @@ pub fn socket_path() -> PathBuf {
     }
     #[cfg(target_os = "windows")]
     {
+        // Named for this user and this Windows session: see
+        // `local_pipe::plane_pipe_name` for why the session is in it.
         let user = std::env::var("USERNAME").unwrap_or_default();
-        PathBuf::from(format!("\\\\.\\pipe\\deskvncviewer-agent-{user}"))
+        PathBuf::from(local_pipe::plane_pipe_name(
+            &user,
+            local_pipe::current_session(),
+        ))
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     {
@@ -663,7 +669,14 @@ pub struct AgentPlane {
     /// Public because the shell's own event pump feeds it: see
     /// [`AgentPlane::feed`], which is the seam `00 R22` puts in the plane
     /// rather than behind the webview bridge.
-    pub mirrors: mirror::Mirrors,
+    pub mirrors: Arc<mirror::Mirrors>,
+    /// H.264 decoded for the mirrors, off the event pump.
+    pub video: video::Video,
+    /// Sessions an agent's `limb.open` dialled, as opposed to sessions a
+    /// person opened and an agent attached to. `limb.close` disconnects the
+    /// first kind and only detaches from the second: an agent closing a
+    /// machine it was handed must not log the person out of it.
+    agent_opened: Mutex<std::collections::HashSet<String>>,
 }
 
 /// What [`AgentPlane::announce`] needs to say anything at all.
@@ -728,6 +741,35 @@ impl AgentPlane {
             board: Mutex::new(agent_lease::Board::new(policy)),
             ..AgentPlane::default()
         }
+    }
+
+    /// Remember that an agent's open dialled this session.
+    pub fn note_agent_opened(&self, session_id: &str) {
+        self.agent_opened.lock().insert(session_id.to_string());
+    }
+
+    /// Did an agent's open dial this session?
+    pub fn agent_opened(&self, session_id: &str) -> bool {
+        self.agent_opened.lock().contains(session_id)
+    }
+
+    /// Forget a session an agent opened, once it has been closed.
+    pub fn forget_agent_opened(&self, session_id: &str) {
+        self.agent_opened.lock().remove(session_id);
+    }
+
+    /// The attachments on one session other than `attachment_id`.
+    pub fn other_attachments(&self, session_id: &str, attachment_id: &str) -> Vec<String> {
+        self.attachments
+            .lock()
+            .get(session_id)
+            .map(|rows| {
+                rows.keys()
+                    .filter(|id| id.as_str() != attachment_id)
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     /// A fresh attachment id, unique within this process run.
@@ -1073,6 +1115,7 @@ impl AgentPlane {
         self.attachments.lock().remove(session_id);
         self.board.lock().remove(session_id);
         self.mirrors.forget(session_id);
+        self.video.forget(session_id);
         // The live total just fell, and the driven one may have with it. This
         // is the only session lifecycle edge the plane is told about: a
         // session being OPENED reaches nothing here, so a bar seeds from
@@ -1098,7 +1141,43 @@ impl AgentPlane {
     /// webview. This is also where the content fence is fed, so it is the
     /// place to start when an agent is refused with SCREEN_CHANGED.
     pub fn feed(&self, session_id: &str, rects: &[vnc_core::DecodedRect]) {
-        self.mirrors.feed(session_id, rects, now());
+        // Video goes to a thread that decodes it, and once a session's video
+        // has, everything after it does too, so the mirror sees it in order.
+        if self.video.carries(session_id)
+            || (video::has_video(rects) && self.mirrors.wants_pixels(session_id))
+        {
+            self.video
+                .feed(&self.mirrors, session_id, rects.to_vec(), || {
+                    self.refresher(session_id)
+                });
+        } else {
+            self.mirrors.feed(session_id, rects, now());
+        }
+    }
+
+    /// What the mirror's video decoder asks the session for the whole
+    /// screen with, when it loses its place: the same `Refresh` a person's
+    /// window sends when it has dropped frames. A Boundary session answers it
+    /// with the whole screen as rectangles and a keyframe after them.
+    fn refresher(&self, session_id: &str) -> video::Refresh {
+        let sessions = self
+            .running
+            .lock()
+            .as_ref()
+            .map(|running| running.sessions.clone());
+        let session_id = session_id.to_string();
+        Box::new(move || {
+            let handle = sessions.as_ref().and_then(|sessions| {
+                sessions
+                    .lock()
+                    .get(&session_id)
+                    .filter(|entry| entry.is_live())
+                    .map(|entry| entry.handle.clone())
+            });
+            if let Some(handle) = handle {
+                let _ = handle.try_send(vnc_core::ClientCommand::Refresh);
+            }
+        })
     }
 
     /// The remote desktop resized. Bumps the geometry generation a read is
@@ -1107,7 +1186,9 @@ impl AgentPlane {
     /// Called from the `DesktopResize` arm of
     /// `commands::session::forward_events`.
     pub fn note_resize(&self, session_id: &str, width: u16, height: u16) {
-        self.mirrors.resize(session_id, width, height);
+        if !self.video.resize(session_id, width, height) {
+            self.mirrors.resize(session_id, width, height);
+        }
     }
 }
 
@@ -1387,6 +1468,7 @@ pub fn stop(plane: &Arc<AgentPlane>) {
     // quality preset back, because the session does not end when the plane
     // does. `AGENT_BRIEF` D2: the interactive product must not be left
     // degraded by a feature somebody switched off.
+    plane.video.forget_all();
     for (session_id, preset) in plane.mirrors.detach_all() {
         let handle = running
             .sessions
@@ -1565,7 +1647,9 @@ mod tests {
     /// Every test in this file is about the listener, the switch and the
     /// counts, and none of them touches a file. The refusal is real rather
     /// than a panic so that a test which grew a file call by accident would
-    /// read a sentence instead of losing the socket task.
+    /// read a sentence instead of losing the socket task. Only the unix
+    /// socket tests build a context, so it is unix only like them.
+    #[cfg(unix)]
     fn no_sidecar() -> server::Filer {
         Arc::new(|_session, _ask, tell| {
             let _ = tell.send(Err(server::FileRefusal::unavailable(

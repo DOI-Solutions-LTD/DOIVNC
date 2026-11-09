@@ -63,7 +63,9 @@ Accessibility permissions are requested on macOS when sharing or control needs
 them. The recipient can revoke control or end the session at any time.
 
 DeskVNC Support ships for macOS, signed and notarized; for Windows, signed;
-and for Linux as an x86_64 binary in a tarball. Browser access and automatic
+and for Linux as a binary in a tarball. On Linux, run
+`./deskvnc-support --install` once after unpacking to add it to your app menu
+with its icon; it writes only to your own folders. Browser access and automatic
 private provider deployment are still in development. The release page
 contains the runnable support apps and the
 repository's `14-support-codes.md` file documents private code services.
@@ -132,6 +134,14 @@ There is a button in that panel that does this for Claude Code for you, and
 are verified over both stdio and HTTP. Codex, Cursor, Gemini CLI, VS Code and
 plain Python agents are covered in
 [the integration notes](docs/AGENTS.md#other-clients).
+
+Registering `dvv` does not open DeskVNCViewer. Starting the MCP server,
+`initialize`, `tools/list` and `dvv_limbs` leave it closed. When an agent calls
+`dvv_hosts`, `dvv_open` or `dvv_group_open` and the app is not running, `dvv`
+starts it once, minimised and without taking focus, and waits for it. If you
+quit it afterwards it stays closed until an agent asks for one of those again.
+Set `DVV_NO_START=1` in the MCP server's environment and `dvv` never starts it;
+those calls then say the app is not running.
 
 The loop is four calls. Open a machine, take the wheel, look, act.
 
